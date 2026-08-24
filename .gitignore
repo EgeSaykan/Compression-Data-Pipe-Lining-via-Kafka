@@ -1,0 +1,20 @@
+
+# libraries
+openzl/
+lib*
+sqlite*
+
+# generated data
+data/
+csv/
+*.csv
+
+# generated binaries
+*.exe
+*.o
+
+# dev files
+bt_discover.*
+compression_tests.*
+generate_data.*
+receiver.cpp
