@@ -18,6 +18,8 @@ bt_discover.*
 compression_tests.*
 generate_data.*
 receiver.cpp
+recieve_usa_kafka.cpp
+recieve_usa_rabbitmq.cpp
 
 # conf
 docker-compose.rabbitmq.yml
