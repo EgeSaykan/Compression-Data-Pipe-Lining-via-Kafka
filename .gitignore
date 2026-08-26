@@ -18,3 +18,9 @@ bt_discover.*
 compression_tests.*
 generate_data.*
 receiver.cpp
+
+# conf
+docker-compose.rabbitmq.yml
+
+# tests
+test*

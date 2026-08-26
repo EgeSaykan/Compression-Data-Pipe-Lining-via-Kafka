@@ -151,7 +151,7 @@ bool readExact(SOCKET sock, void* buffer, size_t n) {
 //
 // Register the SPP service with Windows Bluetooth SDP.
 //
-bool registerSppService(SOCKET sock, int port, HANDLE& serviceHandle) {
+bool registerSppService(int port) {
     SOCKADDR_BTH localAddr{};
     localAddr.addressFamily = AF_BTH;
     localAddr.btAddr = 0;
@@ -217,7 +217,7 @@ SOCKET createBluetoothServer() {
     }
 
     HANDLE serviceHandle = nullptr;
-    if (!registerSppService(sock, boundAddr.port, serviceHandle)) {
+    if (!registerSppService(boundAddr.port)) {
         closesocket(sock);
         return INVALID_SOCKET;
     }
@@ -239,7 +239,9 @@ int main() {
     }
 
     SOCKET server = createBluetoothServer();
+    printf("server socket: %d\n", server);
     if (server == INVALID_SOCKET) {
+        printf("Failed to create Bluetooth server: %d\n", WSAGetLastError());
         WSACleanup();
         return 1;
     }
