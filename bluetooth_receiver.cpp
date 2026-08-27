@@ -20,6 +20,18 @@
 
 namespace phonepipe {
 
+namespace {
+
+int64_t utcNowMs() {
+    FILETIME fileTime{};
+    GetSystemTimeAsFileTime(&fileTime);
+    const uint64_t windowsTime = (static_cast<uint64_t>(fileTime.dwHighDateTime) << 32) |
+                                 fileTime.dwLowDateTime;
+    return static_cast<int64_t>(windowsTime / 10000ULL - 11644473600000ULL);
+}
+
+}
+
 const GUID SPP_UUID = {
     0x00001101, 0x0000, 0x1000,
     {0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB}
@@ -155,6 +167,7 @@ void BluetoothReceiver::run(const PacketHandler& handler) {
     printf("Phone connected!\n");
 
     while (true) {
+        const int64_t receivedBeginTimeMs = utcNowMs();
         uint8_t header[kHeaderSize];
         if (!readExact(client_, header, sizeof(header))) {
             fprintf(stderr, "Phone disconnected or Bluetooth read failed\n");
@@ -168,6 +181,7 @@ void BluetoothReceiver::run(const PacketHandler& handler) {
             fprintf(stderr, "Phone disconnected during payload read\n");
             break;
         }
+        const int64_t receivedEndTimeMs = utcNowMs();
 
         if (packetHeader.streamId != STREAM_GREEN && packetHeader.streamId != STREAM_PINK) {
             fprintf(stderr, "Ignoring packet with unknown stream %u\n", packetHeader.streamId);
@@ -176,7 +190,8 @@ void BluetoothReceiver::run(const PacketHandler& handler) {
 
         printf("[%s] %u rows, %u bytes\n", streamName(packetHeader.streamId),
                packetHeader.rowCount, packetHeader.payloadLen);
-        handler(packetHeader.streamId, std::move(packet));
+        handler(packetHeader.streamId, std::move(packet),
+            receivedBeginTimeMs, receivedEndTimeMs);
     }
 }
 

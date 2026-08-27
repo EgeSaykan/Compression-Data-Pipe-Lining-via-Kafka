@@ -1,9 +1,3 @@
-// RabbitMQ -> OpenZL-compressed per-stream files + SQLite metadata.
-// Build dependencies: rabbitmq-c, sqlite3, and OpenZL.
-//
-// Both streams use one RabbitMQ priority queue. Pink has higher priority and
-// is therefore selected first whenever pink and green are waiting together.
-
 #include <windows.h>
 
 #ifndef AMQP_STATIC
@@ -16,9 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "wire_protocol.h"
@@ -97,10 +89,13 @@ sqlite3* openDb(const std::string& path) {
     sqlite3_exec(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
     const char* schema =
         "CREATE TABLE IF NOT EXISTS batches ("
-        "id INTEGER PRIMARY KEY AUTOINCREMENT, address TEXT NOT NULL,"
-        "begin_index INTEGER NOT NULL, end_index INTEGER NOT NULL,"
-        "initial_time INTEGER NOT NULL, end_time INTEGER NOT NULL);"
-        "CREATE INDEX IF NOT EXISTS idx_batches_address_time ON batches(address, initial_time);";
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, stream_id INTEGER NOT NULL,"
+        "address TEXT NOT NULL, begin_index INTEGER NOT NULL, end_index INTEGER NOT NULL,"
+        "initial_time INTEGER NOT NULL, end_time INTEGER NOT NULL,"
+        "received_time INTEGER NOT NULL DEFAULT 0,"
+        "received_begin_time INTEGER NOT NULL DEFAULT 0,"
+        "received_end_time INTEGER NOT NULL DEFAULT 0);"
+        "CREATE INDEX IF NOT EXISTS idx_batches_stream_time ON batches(stream_id, initial_time);";
     char* error = nullptr;
     if (sqlite3_exec(db, schema, nullptr, nullptr, &error) != SQLITE_OK) {
         fprintf(stderr, "SQLite schema failed: %s\n", error);
@@ -108,19 +103,32 @@ sqlite3* openDb(const std::string& path) {
         sqlite3_close(db);
         return nullptr;
     }
+    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_time INTEGER NOT NULL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_begin_time INTEGER NOT NULL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_end_time INTEGER NOT NULL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
     return db;
 }
 
-bool insertBatch(sqlite3* db, const std::string& name, int64_t begin, int64_t end,
-                 int64_t initialTime, int64_t endTime) {
+bool insertBatch(sqlite3* db, uint8_t streamId, const char* name,
+                 long begin, long end, int64_t initialTime, int64_t endTime,
+                 int64_t receivedBeginTime, int64_t receivedEndTime) {
     sqlite3_stmt* statement = nullptr;
-    const char* sql = "INSERT INTO batches(address,begin_index,end_index,initial_time,end_time) VALUES(?,?,?,?,?)";
+    const char* sql =
+        "INSERT INTO batches(stream_id,address,begin_index,end_index,initial_time,end_time,"
+        "received_time,received_begin_time,received_end_time) VALUES(?,?,?,?,?,?,?,?,?)";
     if (sqlite3_prepare_v2(db, sql, -1, &statement, nullptr) != SQLITE_OK) return false;
-    sqlite3_bind_text(statement, 1, name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(statement, 2, begin);
-    sqlite3_bind_int64(statement, 3, end);
-    sqlite3_bind_int64(statement, 4, initialTime);
-    sqlite3_bind_int64(statement, 5, endTime);
+    sqlite3_bind_int(statement, 1, streamId);
+    sqlite3_bind_text(statement, 2, name, -1, SQLITE_STATIC);
+    sqlite3_bind_int64(statement, 3, begin);
+    sqlite3_bind_int64(statement, 4, end);
+    sqlite3_bind_int64(statement, 5, initialTime);
+    sqlite3_bind_int64(statement, 6, endTime);
+    sqlite3_bind_int64(statement, 7, receivedEndTime);
+    sqlite3_bind_int64(statement, 8, receivedBeginTime);
+    sqlite3_bind_int64(statement, 9, receivedEndTime);
     const bool ok = sqlite3_step(statement) == SQLITE_DONE;
     sqlite3_finalize(statement);
     return ok;
@@ -130,10 +138,8 @@ class RabbitPriorityConsumer {
 public:
     RabbitPriorityConsumer() {
         CreateDirectoryA("data", nullptr);
-        pinkFile_ = fopen("data\\pink.bin", "ab+");
-        greenFile_ = fopen("data\\green.bin", "ab+");
-        pinkDb_ = openDb("data\\pink.sqlite3");
-        greenDb_ = openDb("data\\green.sqlite3");
+        dataFile_ = fopen("data\\phonepipe.bin", "ab+");
+        db_ = openDb("data\\phonepipe.sqlite3");
         connection_ = amqp_new_connection();
         socket_ = amqp_tcp_socket_new(connection_);
         if (!socket_ || amqp_socket_open(socket_, envOr("RABBITMQ_HOST", "localhost"),
@@ -161,7 +167,7 @@ public:
         amqp_queue_declare(connection_, channel_, amqp_cstring_bytes(queue_.c_str()),
                            0, 1, 0, 0, queueArguments);
         if (!rabbitOk(amqp_get_rpc_reply(connection_), "queue declare")) return;
-        for (const char* routingKey : {"pink", "green"}) {
+        for (const char* routingKey : {"high", "low"}) {
             amqp_queue_bind(connection_, channel_, amqp_cstring_bytes(queue_.c_str()),
                             amqp_cstring_bytes(exchange.c_str()), amqp_cstring_bytes(routingKey),
                             amqp_empty_table);
@@ -179,33 +185,24 @@ public:
             amqp_connection_close(connection_, AMQP_REPLY_SUCCESS);
             amqp_destroy_connection(connection_);
         }
-        if (pinkFile_) fclose(pinkFile_);
-        if (greenFile_) fclose(greenFile_);
-        if (pinkDb_) sqlite3_close(pinkDb_);
-        if (greenDb_) sqlite3_close(greenDb_);
+        if (dataFile_) fclose(dataFile_);
+        if (db_) sqlite3_close(db_);
     }
 
-    bool ok() const {
-        return ready_ && pinkFile_ && greenFile_ && pinkDb_ && greenDb_;
-    }
+    bool ok() const { return ready_ && dataFile_ && db_; }
 
     void run() {
         while (true) {
             amqp_envelope_t envelope;
             const amqp_rpc_reply_t reply = amqp_consume_message(connection_, &envelope, nullptr, 1000);
             if (reply.reply_type == AMQP_RESPONSE_NORMAL) {
-                const bool stored = handle(
-                    static_cast<const uint8_t*>(envelope.message.body.bytes),
-                    envelope.message.body.len);
-                if (stored) {
-                    amqp_basic_ack(connection_, channel_, envelope.delivery_tag, 0);
-                } else {
-                    // Do not redeliver a malformed or permanently unwritable batch.
-                    amqp_basic_reject(connection_, channel_, envelope.delivery_tag, 0);
-                }
+                const bool stored = handle(static_cast<const uint8_t*>(envelope.message.body.bytes),
+                                           envelope.message.body.len);
+                if (stored) amqp_basic_ack(connection_, channel_, envelope.delivery_tag, 0);
+                else amqp_basic_reject(connection_, channel_, envelope.delivery_tag, 0);
                 amqp_destroy_envelope(&envelope);
             } else if (reply.reply_type != AMQP_RESPONSE_LIBRARY_EXCEPTION) {
-                fprintf(stderr, "[%s] RabbitMQ consume error\n", queue_.c_str());
+                fprintf(stderr, "RabbitMQ consume error\n");
             }
         }
     }
@@ -214,36 +211,36 @@ private:
     bool handle(const uint8_t* raw, size_t length) {
         if (length < kHeaderSize) return false;
         const PacketHeader header = decodeHeader(raw);
-        if (header.streamId != STREAM_GREEN && header.streamId != STREAM_PINK) return false;
-        if (length - kHeaderSize != header.payloadLen) return false;
+        const size_t wireSize = kHeaderSize + header.payloadLen;
+        if (length != wireSize && length != wireSize + kLegacyReceivedTimeSize &&
+            length != wireSize + kReceivedTimeSize) return false;
+        const int64_t receivedBeginTime = length == wireSize + kReceivedTimeSize
+            ? getReceivedBeginTimeMs(raw, wireSize)
+            : (length == wireSize + kLegacyReceivedTimeSize
+                ? getReceivedBeginTimeMs(raw, wireSize) : 0);
+        const int64_t receivedEndTime = length == wireSize + kReceivedTimeSize
+            ? getReceivedEndTimeMs(raw, wireSize) : receivedBeginTime;
 
-        const char* name = streamName(header.streamId);
-        FILE* file = header.streamId == STREAM_PINK ? pinkFile_ : greenFile_;
-        sqlite3* db = header.streamId == STREAM_PINK ? pinkDb_ : greenDb_;
-
-        std::vector<uint8_t> payload(raw + kHeaderSize, raw + length);
+        std::vector<uint8_t> payload(raw + kHeaderSize, raw + wireSize);
         std::vector<uint8_t> compressed = header.compressed
             ? std::move(payload) : compressColumns(payload, header.rowCount);
-         if (compressed.empty()) return false;
-
-           if (fseek(file, 0, SEEK_END) != 0) return false;
-           const long begin = ftell(file);
-           if (begin < 0 || fwrite(compressed.data(), 1, compressed.size(), file) != compressed.size()) return false;
-           fflush(file);
+        if (compressed.empty()) return false;
+        if (fseek(dataFile_, 0, SEEK_END) != 0) return false;
+        const long begin = ftell(dataFile_);
+        if (begin < 0 || fwrite(compressed.data(), 1, compressed.size(), dataFile_) != compressed.size()) return false;
+        fflush(dataFile_);
         const long end = begin + static_cast<long>(compressed.size());
-           if (!insertBatch(db, name, begin, end, header.initialTimeMs, header.endTimeMs)) return false;
-         printf("[%s] wrote %zu bytes at [%ld, %ld), t=[%lld..%lld]\n",
-               name, compressed.size(), begin, end,
-             static_cast<long long>(header.initialTimeMs),
-             static_cast<long long>(header.endTimeMs));
-         return true;
+        if (!insertBatch(db_, header.streamId, streamName(header.streamId), begin, end,
+                         header.initialTimeMs, header.endTimeMs,
+                         receivedBeginTime, receivedEndTime)) return false;
+        printf("[%s:%u] wrote %zu bytes at [%ld, %ld)\n",
+               streamName(header.streamId), header.streamId, compressed.size(), begin, end);
+        return true;
     }
 
     std::string queue_;
-    FILE* pinkFile_ = nullptr;
-    FILE* greenFile_ = nullptr;
-    sqlite3* pinkDb_ = nullptr;
-    sqlite3* greenDb_ = nullptr;
+    FILE* dataFile_ = nullptr;
+    sqlite3* db_ = nullptr;
     amqp_connection_state_t connection_ = nullptr;
     amqp_socket_t* socket_ = nullptr;
     amqp_channel_t channel_ = 1;
@@ -255,10 +252,9 @@ private:
 int main() {
     RabbitPriorityConsumer consumer;
     if (!consumer.ok()) {
-        fprintf(stderr, "Failed to initialize RabbitMQ stream consumers\n");
+        fprintf(stderr, "Failed to initialize RabbitMQ stream consumer\n");
         return 1;
     }
-
     consumer.run();
     return 0;
 }

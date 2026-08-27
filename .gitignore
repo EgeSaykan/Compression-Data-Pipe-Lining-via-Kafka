@@ -20,6 +20,7 @@ generate_data.*
 receiver.cpp
 recieve_usa_kafka.cpp
 recieve_usa_rabbitmq.cpp
+read_sql.py
 
 # conf
 docker-compose.rabbitmq.yml

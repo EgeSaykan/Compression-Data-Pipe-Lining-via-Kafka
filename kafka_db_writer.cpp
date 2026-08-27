@@ -47,10 +47,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <thread>
 #include <vector>
 #include <memory>
-#include <mutex>
 
 #include "wire_protocol.h"
 
@@ -207,14 +205,18 @@ sqlite3* openDb(const std::string& path) {
     const char* createTable =
         "CREATE TABLE IF NOT EXISTS batches ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  stream_id INTEGER NOT NULL,"
         "  address TEXT NOT NULL,"
         "  begin_index INTEGER NOT NULL,"
         "  end_index INTEGER NOT NULL,"
         "  initial_time INTEGER NOT NULL,"
-        "  end_time INTEGER NOT NULL"
+        "  end_time INTEGER NOT NULL,"
+        "  received_time INTEGER NOT NULL DEFAULT 0,"
+        "  received_begin_time INTEGER NOT NULL DEFAULT 0,"
+        "  received_end_time INTEGER NOT NULL DEFAULT 0"
         ");"
         "CREATE INDEX IF NOT EXISTS idx_batches_address_time "
-        "  ON batches(address, initial_time);";
+        "  ON batches(stream_id, initial_time);";
 
     char* err = nullptr;
     if (sqlite3_exec(db, createTable, nullptr, nullptr, &err) != SQLITE_OK) {
@@ -223,16 +225,23 @@ sqlite3* openDb(const std::string& path) {
         sqlite3_close(db);
         return nullptr;
     }
+    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_time INTEGER NOT NULL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_begin_time INTEGER NOT NULL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_end_time INTEGER NOT NULL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
 
     return db;
 }
 
-bool insertBatchRow(sqlite3* db, const std::string& address,
+bool insertBatchRow(sqlite3* db, uint8_t streamId, const std::string& address,
                      int64_t beginIndex, int64_t endIndex,
-                     int64_t initialTime, int64_t endTime) {
+                     int64_t initialTime, int64_t endTime,
+                     int64_t receivedBeginTime, int64_t receivedEndTime) {
     static const char* sql =
-        "INSERT INTO batches (address, begin_index, end_index, initial_time, end_time) "
-        "VALUES (?, ?, ?, ?, ?);";
+        "INSERT INTO batches (stream_id, address, begin_index, end_index, initial_time, end_time, "
+        "received_time, received_begin_time, received_end_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -240,11 +249,15 @@ bool insertBatchRow(sqlite3* db, const std::string& address,
         return false;
     }
 
-    sqlite3_bind_text(stmt, 1, address.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 2, beginIndex);
-    sqlite3_bind_int64(stmt, 3, endIndex);
-    sqlite3_bind_int64(stmt, 4, initialTime);
-    sqlite3_bind_int64(stmt, 5, endTime);
+    sqlite3_bind_int(stmt, 1, streamId);
+    sqlite3_bind_text(stmt, 2, address.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, beginIndex);
+    sqlite3_bind_int64(stmt, 4, endIndex);
+    sqlite3_bind_int64(stmt, 5, initialTime);
+    sqlite3_bind_int64(stmt, 6, endTime);
+    sqlite3_bind_int64(stmt, 7, receivedEndTime);
+    sqlite3_bind_int64(stmt, 8, receivedBeginTime);
+    sqlite3_bind_int64(stmt, 9, receivedEndTime);
 
     const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
     if (!ok) {
@@ -261,11 +274,9 @@ bool insertBatchRow(sqlite3* db, const std::string& address,
 // ---------------------------------------------------------------------------
 class StreamWriter {
 public:
-    StreamWriter(uint8_t streamId, const std::string& brokers, const std::string& dataDir)
-        : streamId_(streamId), name_(streamName(streamId)) {
-
-        binPath_ = dataDir + "\\" + name_ + ".bin";
-        dbPath_  = dataDir + "\\" + name_ + ".sqlite3";
+    StreamWriter(const std::string& brokers, const std::string& dataDir) {
+        binPath_ = dataDir + "\\phonepipe.bin";
+        dbPath_  = dataDir + "\\phonepipe.sqlite3";
 
         db_ = openDb(dbPath_);
 
@@ -278,19 +289,21 @@ public:
         std::unique_ptr<RdKafka::Conf> conf(
             RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
         conf->set("bootstrap.servers", brokers, errstr);
-        conf->set("group.id", "phonepipe-db-writer-" + name_, errstr);
+        conf->set("group.id", "phonepipe-db-writer", errstr);
         conf->set("enable.auto.commit", "true", errstr);
         conf->set("auto.offset.reset", "earliest", errstr);
+        conf->set("allow.auto.create.topics", "true", errstr);
 
         consumer_.reset(RdKafka::KafkaConsumer::create(conf.get(), errstr));
         if (!consumer_) {
-            fprintf(stderr, "Failed to create consumer for %s: %s\n", name_.c_str(), errstr.c_str());
+            fprintf(stderr, "Failed to create Kafka consumer: %s\n", errstr.c_str());
             return;
         }
 
-        RdKafka::ErrorCode err = consumer_->subscribe({kafkaTopicFor(streamId_)});
+        RdKafka::ErrorCode err = consumer_->subscribe({"phonepipe.low", "phonepipe.high"});
         if (err != RdKafka::ERR_NO_ERROR) {
-            fprintf(stderr, "Subscribe failed for %s: %s\n", name_.c_str(), RdKafka::err2str(err).c_str());
+            fprintf(stderr, "Subscribe failed: %s\n", RdKafka::err2str(err).c_str());
+            return;
         }
     }
 
@@ -320,7 +333,7 @@ public:
                 case RdKafka::ERR__PARTITION_EOF:
                     continue;
                 default:
-                    fprintf(stderr, "[%s] Kafka consume error: %s\n", name_.c_str(), msg->errstr().c_str());
+                    fprintf(stderr, "Kafka consume error: %s\n", msg->errstr().c_str());
                     continue;
             }
         }
@@ -329,19 +342,27 @@ public:
 private:
     void handleMessage(const uint8_t* raw, size_t len) {
         if (len < kHeaderSize) {
-            fprintf(stderr, "[%s] short Kafka message (%zu bytes)\n", name_.c_str(), len);
+            fprintf(stderr, "short Kafka message (%zu bytes)\n", len);
             return;
         }
 
         const PacketHeader hdr = decodeHeader(raw);
         const uint8_t* payloadPtr = raw + kHeaderSize;
-        const size_t payloadLen = len - kHeaderSize;
-
-        if (payloadLen != hdr.payloadLen) {
-            fprintf(stderr, "[%s] payload length mismatch: header says %u, got %zu\n",
-                    name_.c_str(), hdr.payloadLen, payloadLen);
+        const size_t wireSize = kHeaderSize + hdr.payloadLen;
+        if (len != wireSize && len != wireSize + kLegacyReceivedTimeSize &&
+            len != wireSize + kReceivedTimeSize) {
+            fprintf(stderr, "packet length mismatch: header says %u, got %zu\n",
+                    hdr.payloadLen, len - kHeaderSize);
             return;
         }
+        const size_t payloadLen = hdr.payloadLen;
+        const int64_t receivedBeginTime = len == wireSize + kReceivedTimeSize
+            ? getReceivedBeginTimeMs(raw, wireSize)
+            : (len == wireSize + kLegacyReceivedTimeSize
+                ? getReceivedBeginTimeMs(raw, wireSize) : 0);
+        const int64_t receivedEndTime = len == wireSize + kReceivedTimeSize
+            ? getReceivedEndTimeMs(raw, wireSize) : receivedBeginTime;
+
 
         std::vector<uint8_t> compressedBytes;
 
@@ -351,48 +372,48 @@ private:
         } else {
             // Raw (delta-encoded) columnar payload -- compress here so the
             // binary file always holds a uniformly compressed stream.
-            std::vector<uint8_t> raw(payloadPtr, payloadPtr + payloadLen);
+            std::vector<uint8_t> raw(payloadPtr, payloadPtr + hdr.payloadLen);
             compressedBytes = compressColumns(raw, hdr.rowCount);
             if (compressedBytes.empty()) {
-                fprintf(stderr, "[%s] compress-on-ingest failed, dropping batch\n", name_.c_str());
+                fprintf(stderr, "compress-on-ingest failed, dropping batch\n");
                 return;
             }
         }
 
         // Append to this stream's binary file and record the byte range.
         if (fseek(binFile_, 0, SEEK_END) != 0) {
-            fprintf(stderr, "[%s] seek failed on %s\n", name_.c_str(), binPath_.c_str());
+            fprintf(stderr, "seek failed on %s\n", binPath_.c_str());
             return;
         }
 
         const long beginIndex = ftell(binFile_);
         if (beginIndex < 0) {
-            fprintf(stderr, "[%s] ftell failed on %s\n", name_.c_str(), binPath_.c_str());
+            fprintf(stderr, "ftell failed on %s\n", binPath_.c_str());
             return;
         }
 
         const size_t written = fwrite(compressedBytes.data(), 1, compressedBytes.size(), binFile_);
         if (written != compressedBytes.size()) {
-            fprintf(stderr, "[%s] short write to %s\n", name_.c_str(), binPath_.c_str());
+            fprintf(stderr, "short write to %s\n", binPath_.c_str());
             return;
         }
         fflush(binFile_);
 
         const long endIndex = beginIndex + static_cast<long>(written);
 
-        if (!insertBatchRow(db_, name_, beginIndex, endIndex, hdr.initialTimeMs, hdr.endTimeMs)) {
-            fprintf(stderr, "[%s] DB insert failed for batch [%ld, %ld)\n", name_.c_str(), beginIndex, endIndex);
+        if (!insertBatchRow(db_, hdr.streamId, streamName(hdr.streamId), beginIndex,
+                            endIndex, hdr.initialTimeMs, hdr.endTimeMs,
+                            receivedBeginTime, receivedEndTime)) {
+            fprintf(stderr, "DB insert failed for batch [%ld, %ld)\n", beginIndex, endIndex);
             return;
         }
 
-        printf("[%s] stored %zu compressed bytes at [%ld, %ld), t=[%lld..%lld]\n",
-               name_.c_str(), compressedBytes.size(), beginIndex, endIndex,
+         printf("[%s:%u] stored %zu compressed bytes at [%ld, %ld), t=[%lld..%lld]\n",
+             streamName(hdr.streamId), hdr.streamId, compressedBytes.size(), beginIndex, endIndex,
                static_cast<long long>(hdr.initialTimeMs),
                static_cast<long long>(hdr.endTimeMs));
     }
 
-    uint8_t streamId_;
-    std::string name_;
     std::string binPath_;
     std::string dbPath_;
 
@@ -412,21 +433,12 @@ int main() {
     std::string dataDir = "data";
     CreateDirectoryA(dataDir.c_str(), nullptr); // ok if it already exists
 
-    StreamWriter greenWriter(STREAM_GREEN, brokers, dataDir);
-    StreamWriter pinkWriter(STREAM_PINK, brokers, dataDir);
-
-    if (!greenWriter.ok() || !pinkWriter.ok()) {
-        fprintf(stderr, "Failed to initialize one or both stream writers\n");
+    StreamWriter writer(brokers, dataDir);
+    if (!writer.ok()) {
+        fprintf(stderr, "Failed to initialize Kafka stream writer\n");
         return 1;
     }
-
-    // Two independent threads, two independent consumers, two independent
-    // files/DBs -- green and pink never wait on each other.
-    std::thread greenThread([&greenWriter] { greenWriter.run(); });
-    std::thread pinkThread([&pinkWriter] { pinkWriter.run(); });
-
-    greenThread.join();
-    pinkThread.join();
+    writer.run();
 
     return 0;
 }

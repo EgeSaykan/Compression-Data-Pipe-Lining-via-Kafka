@@ -56,7 +56,7 @@ RabbitBatchProducer::RabbitBatchProducer() {
         amqp_queue_declare(connection_, channel_, amqp_cstring_bytes("phonepipe-db"),
                            0, 1, 0, 0, queueArguments);
         if (!checkRabbit(amqp_get_rpc_reply(connection_), "queue declare")) return;
-        for (const char* routingKey : {"pink", "green"}) {
+        for (const char* routingKey : {"high", "low"}) {
             amqp_queue_bind(connection_, channel_, amqp_cstring_bytes("phonepipe-db"),
                             amqp_cstring_bytes(exchange.c_str()), amqp_cstring_bytes(routingKey),
                             amqp_empty_table);
@@ -79,7 +79,8 @@ bool RabbitBatchProducer::ok() const {
 }
 
 bool RabbitBatchProducer::publish(uint8_t streamId, const std::vector<uint8_t>& packet) {
-        const std::string key = phonepipe::streamName(streamId);
+        const std::string key = phonepipe::parentStream(streamId) == phonepipe::STREAM_PINK
+            ? "high" : "low";
         amqp_bytes_t body{
             packet.size(),
             const_cast<uint8_t*>(packet.data())
@@ -87,7 +88,7 @@ bool RabbitBatchProducer::publish(uint8_t streamId, const std::vector<uint8_t>& 
         amqp_basic_properties_t props{};
         props._flags = AMQP_BASIC_DELIVERY_MODE_FLAG | AMQP_BASIC_PRIORITY_FLAG;
         props.delivery_mode = 2; // survive broker restart when queues are durable
-        props.priority = streamId == phonepipe::STREAM_PINK ? 10 : 1;
+        props.priority = phonepipe::parentStream(streamId) == phonepipe::STREAM_PINK ? 10 : 1;
         const int result = amqp_basic_publish(
             connection_, channel_, amqp_cstring_bytes(exchange_.c_str()),
             amqp_cstring_bytes(key.c_str()), 0, 0, &props,

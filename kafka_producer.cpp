@@ -8,8 +8,8 @@
 #include "wire_protocol.h"
 
 
-using phonepipe::streamName;
 using phonepipe::kafkaTopicFor;
+using phonepipe::streamName;
 
 KafkaBatchProducer::KafkaBatchProducer(const std::string& brokers) {
         std::string errstr;
@@ -37,7 +37,7 @@ void KafkaBatchProducer::publish(uint8_t streamId, std::vector<uint8_t>&& rawPac
         if (!producer_) return;
 
         const std::string topic = kafkaTopicFor(streamId);
-        const std::string key = streamName(streamId);
+        const std::string key = std::to_string(streamId);
 
         // produce() takes ownership of rawPacket's buffer via RK_MSG_COPY-free
         // path is avoided here for simplicity/safety; we copy once into the

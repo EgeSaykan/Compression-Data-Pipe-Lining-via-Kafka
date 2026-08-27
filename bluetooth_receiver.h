@@ -10,7 +10,7 @@
 
 namespace phonepipe {
 
-using PacketHandler = std::function<void(uint8_t, std::vector<uint8_t>&&)>;
+using PacketHandler = std::function<void(uint8_t, std::vector<uint8_t>&&, int64_t, int64_t)>;
 
 class BluetoothReceiver {
 public:

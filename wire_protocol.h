@@ -10,7 +10,7 @@
 // regardless of the compressed flag in byte 0):
 //
 //   byte 0        : 0x01 = OpenZL compressed, 0x00 = raw columnar (delta-encoded)
-//   byte 1        : streamId (0 = green, 1 = pink)
+//   byte 1        : virtual streamId (even IDs = green, odd IDs = pink)
 //   bytes 2..5    : rowCount             uint32 big-endian
 //   bytes 6..9    : payloadLen           uint32 big-endian
 //   bytes 10..17  : initialTimeMs        int64  big-endian (timestamp of first row in batch)
@@ -35,15 +35,30 @@
 #include <cstdint>
 #include <cstddef>
 #include <string>
+#include <vector>
 
 namespace phonepipe {
 
 constexpr size_t kHeaderSize = 26;
+constexpr size_t kLegacyReceivedTimeSize = 8;
+constexpr size_t kReceivedTimeSize = 16;
 constexpr int    kFieldCount = 9;
 constexpr size_t kColWidth   = 8;
 
 constexpr uint8_t STREAM_GREEN = 0;
 constexpr uint8_t STREAM_PINK  = 1;
+
+inline bool isValidStream(uint8_t streamId) {
+    return streamId <= 255;
+}
+
+inline uint8_t parentStream(uint8_t streamId) {
+    return streamId % 2 == 0 ? STREAM_GREEN : STREAM_PINK;
+}
+
+inline uint8_t virtualStreamId(uint8_t parentId, uint32_t copyIndex) {
+    return static_cast<uint8_t>(copyIndex * 2 + (parentId == STREAM_PINK ? 1 : 0));
+}
 
 struct PacketHeader {
     bool     compressed = false;
@@ -81,6 +96,23 @@ inline int64_t getI64BE(const uint8_t* p) {
     return static_cast<int64_t>(u);
 }
 
+inline void appendReceivedTimes(std::vector<uint8_t>& packet,
+                                int64_t receivedBeginTimeMs,
+                                int64_t receivedEndTimeMs) {
+    const size_t offset = packet.size();
+    packet.resize(offset + kReceivedTimeSize);
+    putI64BE(packet.data() + offset, receivedBeginTimeMs);
+    putI64BE(packet.data() + offset + 8, receivedEndTimeMs);
+}
+
+inline int64_t getReceivedBeginTimeMs(const uint8_t* packet, size_t offset) {
+    return getI64BE(packet + offset);
+}
+
+inline int64_t getReceivedEndTimeMs(const uint8_t* packet, size_t offset) {
+    return getI64BE(packet + offset + 8);
+}
+
 inline PacketHeader decodeHeader(const uint8_t* h) {
     PacketHeader hdr;
     hdr.compressed    = h[0] == 0x01;
@@ -102,13 +134,14 @@ inline void encodeHeader(uint8_t* h, const PacketHeader& hdr) {
 }
 
 inline const char* streamName(uint8_t streamId) {
-    if (streamId == STREAM_GREEN) return "green";
-    if (streamId == STREAM_PINK)  return "pink";
+    if (parentStream(streamId) == STREAM_GREEN) return "green";
+    if (parentStream(streamId) == STREAM_PINK)  return "pink";
     return "unknown";
 }
 
 inline std::string kafkaTopicFor(uint8_t streamId) {
-    return std::string("phonepipe.") + streamName(streamId);
+    return std::string("phonepipe.") +
+           (parentStream(streamId) == STREAM_PINK ? "high" : "low");
 }
 
 } // namespace phonepipe
