@@ -157,41 +157,49 @@ bool BluetoothReceiver::ok() const {
 void BluetoothReceiver::run(const PacketHandler& handler) {
     if (!ok()) return;
 
-    SOCKADDR_BTH clientAddr{};
-    int clientLength = sizeof(clientAddr);
-    client_ = accept(server_, reinterpret_cast<SOCKADDR*>(&clientAddr), &clientLength);
-    if (client_ == INVALID_SOCKET) {
-        fprintf(stderr, "accept() failed: %d\n", WSAGetLastError());
-        return;
-    }
-    printf("Phone connected!\n");
-
     while (true) {
-        const int64_t receivedBeginTimeMs = utcNowMs();
-        uint8_t header[kHeaderSize];
-        if (!readExact(client_, header, sizeof(header))) {
-            fprintf(stderr, "Phone disconnected or Bluetooth read failed\n");
-            break;
+        SOCKADDR_BTH clientAddr{};
+        int clientLength = sizeof(clientAddr);
+        client_ = accept(server_, reinterpret_cast<SOCKADDR*>(&clientAddr), &clientLength);
+        if (client_ == INVALID_SOCKET) {
+            fprintf(stderr, "accept() failed: %d\n", WSAGetLastError());
+            return;
+        }
+        printf("Phone connected!\n");
+
+        bool connected = true;
+        while (connected) {
+            const int64_t receivedBeginTimeMs = utcNowMs();
+            uint8_t header[kHeaderSize];
+            if (!readExact(client_, header, sizeof(header))) {
+                fprintf(stderr, "Phone disconnected or Bluetooth read failed\n");
+                connected = false;
+                continue;
+            }
+
+            const PacketHeader packetHeader = decodeHeader(header);
+            std::vector<uint8_t> packet(kHeaderSize + packetHeader.payloadLen);
+            std::memcpy(packet.data(), header, kHeaderSize);
+            if (!readExact(client_, packet.data() + kHeaderSize, packetHeader.payloadLen)) {
+                fprintf(stderr, "Phone disconnected during payload read\n");
+                connected = false;
+                continue;
+            }
+            const int64_t receivedEndTimeMs = utcNowMs();
+
+            if (packetHeader.streamId != STREAM_GREEN && packetHeader.streamId != STREAM_PINK) {
+                fprintf(stderr, "Ignoring packet with unknown stream %u\n", packetHeader.streamId);
+                continue;
+            }
+
+            printf("[%s] %u rows, %u bytes\n", streamName(packetHeader.streamId),
+                   packetHeader.rowCount, packetHeader.payloadLen);
+            handler(packetHeader.streamId, std::move(packet),
+                receivedBeginTimeMs, receivedEndTimeMs);
         }
 
-        const PacketHeader packetHeader = decodeHeader(header);
-        std::vector<uint8_t> packet(kHeaderSize + packetHeader.payloadLen);
-        std::memcpy(packet.data(), header, kHeaderSize);
-        if (!readExact(client_, packet.data() + kHeaderSize, packetHeader.payloadLen)) {
-            fprintf(stderr, "Phone disconnected during payload read\n");
-            break;
-        }
-        const int64_t receivedEndTimeMs = utcNowMs();
-
-        if (packetHeader.streamId != STREAM_GREEN && packetHeader.streamId != STREAM_PINK) {
-            fprintf(stderr, "Ignoring packet with unknown stream %u\n", packetHeader.streamId);
-            continue;
-        }
-
-        printf("[%s] %u rows, %u bytes\n", streamName(packetHeader.streamId),
-               packetHeader.rowCount, packetHeader.payloadLen);
-        handler(packetHeader.streamId, std::move(packet),
-            receivedBeginTimeMs, receivedEndTimeMs);
+        closesocket(client_);
+        client_ = INVALID_SOCKET;
     }
 }
 

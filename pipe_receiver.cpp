@@ -6,10 +6,12 @@
 #include <cstdlib>
 #include <cerrno>
 #include <climits>
+#include <thread>
 #include <string>
 #include <vector>
 
 #include "bluetooth_receiver.h"
+#include "client_bluetooth.h"
 #include "rabbit_producer.h"
 #include "kafka_producer.h"
 #include "wire_protocol.h"
@@ -42,14 +44,20 @@ int main(int argc, char* argv[]) {
 
 	phonepipe::BluetoothReceiver receiver;
 	if (!receiver.ok()) return 1;
+	tabletpipe::TabletServer tabletServer;
+	if (!tabletServer.ok()) return 1;
 
 	if (std::string(argv[1]) == "--kafka") {
 		const char* configuredBrokers = std::getenv("KAFKA_BROKERS");
 		KafkaBatchProducer producer(configuredBrokers ? configuredBrokers : "localhost:9092");
 		if (!producer.ok()) return 1;
 
-		receiver.run([&producer, copyCount](uint8_t streamId, std::vector<uint8_t>&& packet,
+		std::thread tabletThread([&tabletServer] { tabletServer.run(); });
+		receiver.run([&producer, &tabletServer, copyCount](uint8_t streamId, std::vector<uint8_t>&& packet,
 										int64_t receivedBeginTimeMs, int64_t receivedEndTimeMs) {
+			if (tabletServer.isLiveClientConnected()) {
+				tabletServer.offerLivePacket(streamId, packet, receivedBeginTimeMs, receivedEndTimeMs);
+			}
             for (uint32_t copyIndex = 0; copyIndex < copyCount; ++copyIndex) {
                 std::vector<uint8_t> copy = packet;
                 copy[1] = phonepipe::virtualStreamId(streamId, copyIndex);
@@ -58,12 +66,18 @@ int main(int argc, char* argv[]) {
 			}
 		});
 		producer.flush(5000);
+		tabletServer.stop();
+		tabletThread.join();
 	} else {
 		RabbitBatchProducer producer;
 		if (!producer.ok()) return 1;
 
-		receiver.run([&producer, copyCount](uint8_t streamId, std::vector<uint8_t>&& packet,
+		std::thread tabletThread([&tabletServer] { tabletServer.run(); });
+		receiver.run([&producer, &tabletServer, copyCount](uint8_t streamId, std::vector<uint8_t>&& packet,
 										int64_t receivedBeginTimeMs, int64_t receivedEndTimeMs) {
+			if (tabletServer.isLiveClientConnected()) {
+				tabletServer.offerLivePacket(streamId, packet, receivedBeginTimeMs, receivedEndTimeMs);
+			}
             for (uint32_t copyIndex = 0; copyIndex < copyCount; ++copyIndex) {
                 std::vector<uint8_t> copy = packet;
                 copy[1] = phonepipe::virtualStreamId(streamId, copyIndex);
@@ -71,6 +85,8 @@ int main(int argc, char* argv[]) {
 				producer.publish(copy[1], copy);
 			}
 		});
+		tabletServer.stop();
+		tabletThread.join();
 	}
 
 	return 0;
