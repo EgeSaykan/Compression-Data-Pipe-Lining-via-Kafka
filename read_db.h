@@ -28,6 +28,7 @@ struct Record {
     int64_t endIndex = 0;
     int64_t initialTime = 0;
     int64_t endTime = 0;
+    int64_t rowCount = 0;
     int64_t receivedBeginTime = 0;
     int64_t receivedEndTime = 0;
     std::vector<uint8_t> compressedBytes;

@@ -21,17 +21,18 @@ int main() {
     assert(sqlite3_exec(db,
         "CREATE TABLE batches (id INTEGER PRIMARY KEY AUTOINCREMENT, stream_id INTEGER NOT NULL, "
         "address TEXT NOT NULL, begin_index INTEGER NOT NULL, end_index INTEGER NOT NULL, "
-        "initial_time INTEGER NOT NULL, end_time INTEGER NOT NULL, "
+        "initial_time INTEGER NOT NULL, end_time INTEGER NOT NULL, row_count INTEGER NOT NULL, "
         "received_begin_time INTEGER NOT NULL DEFAULT 0, received_end_time INTEGER NOT NULL DEFAULT 0);"
         "INSERT INTO batches(stream_id,address,begin_index,end_index,initial_time,end_time) "
-        "VALUES(0,'green',0,3,100,102);"
+        "VALUES(0,'green',0,3,100,102,10);"
         "INSERT INTO batches(stream_id,address,begin_index,end_index,initial_time,end_time) "
-        "VALUES(1,'pink',3,6,200,202);", nullptr, nullptr, nullptr) == SQLITE_OK);
+        "VALUES(1,'pink',3,6,200,202,20);", nullptr, nullptr, nullptr) == SQLITE_OK);
     sqlite3_close(db);
 
     tabletpipe::ReadDb reader(databasePath, binaryPath);
     auto first = reader.readSince(0);
     assert(first.ok() && first.records.size() == 2);
+    assert(first.records[0].rowCount == 10 && first.records[1].rowCount == 20);
     assert(first.records[0].id == 1 && first.records[0].compressedBytes[0] == 'a');
     auto second = reader.readRange({tabletpipe::RangeKey::Timestamp, 1, 150, 250});
     assert(second.ok() && second.records.size() == 1 && second.records[0].id == 2);

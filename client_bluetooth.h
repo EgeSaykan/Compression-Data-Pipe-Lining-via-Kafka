@@ -16,6 +16,7 @@ struct QueuedPacket {
     uint8_t streamId = 0;
     int64_t receivedBeginTimeMs = 0;
     int64_t receivedEndTimeMs = 0;
+    uint32_t rowCount;
     std::vector<uint8_t> packet;
 };
 
@@ -31,8 +32,7 @@ public:
     bool ok() const;
     bool isLiveClientConnected() const;
     void offerLivePacket(uint8_t streamId, const std::vector<uint8_t>& packet,
-                         int64_t receivedBeginTimeMs = 0,
-                         int64_t receivedEndTimeMs = 0);
+                      int64_t receivedBeginTimeMs, int64_t receivedEndTimeMs, uint32_t rowCount);
     void run();
     void stop();
 

@@ -211,6 +211,7 @@ sqlite3* openDb(const std::string& path) {
         "  end_index INTEGER NOT NULL,"
         "  initial_time INTEGER NOT NULL,"
         "  end_time INTEGER NOT NULL,"
+        "  row_count INTEGER NOT NULL DEFAULT 0,"
         "  received_time INTEGER NOT NULL DEFAULT 0,"
         "  received_begin_time INTEGER NOT NULL DEFAULT 0,"
         "  received_end_time INTEGER NOT NULL DEFAULT 0"
@@ -231,6 +232,8 @@ sqlite3* openDb(const std::string& path) {
                  nullptr, nullptr, nullptr);
     sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_end_time INTEGER NOT NULL DEFAULT 0;",
                  nullptr, nullptr, nullptr);
+    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN row_count INTEGER NOT NULL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
 
     return db;
 }
@@ -238,10 +241,11 @@ sqlite3* openDb(const std::string& path) {
 bool insertBatchRow(sqlite3* db, uint8_t streamId, const std::string& address,
                      int64_t beginIndex, int64_t endIndex,
                      int64_t initialTime, int64_t endTime,
-                     int64_t receivedBeginTime, int64_t receivedEndTime) {
+                     int64_t receivedBeginTime, int64_t receivedEndTime,
+                     uint32_t rowCount) {
     static const char* sql =
         "INSERT INTO batches (stream_id, address, begin_index, end_index, initial_time, end_time, "
-        "received_time, received_begin_time, received_end_time) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        "received_time, received_begin_time, received_end_time, row_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
@@ -258,6 +262,7 @@ bool insertBatchRow(sqlite3* db, uint8_t streamId, const std::string& address,
     sqlite3_bind_int64(stmt, 7, receivedEndTime);
     sqlite3_bind_int64(stmt, 8, receivedBeginTime);
     sqlite3_bind_int64(stmt, 9, receivedEndTime);
+    sqlite3_bind_int(stmt, 10, static_cast<int>(rowCount));
 
     const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
     if (!ok) {
@@ -403,7 +408,7 @@ private:
 
         if (!insertBatchRow(db_, hdr.streamId, streamName(hdr.streamId), beginIndex,
                             endIndex, hdr.initialTimeMs, hdr.endTimeMs,
-                            receivedBeginTime, receivedEndTime)) {
+                            receivedBeginTime, receivedEndTime, hdr.rowCount)) {
             fprintf(stderr, "DB insert failed for batch [%ld, %ld)\n", beginIndex, endIndex);
             return;
         }

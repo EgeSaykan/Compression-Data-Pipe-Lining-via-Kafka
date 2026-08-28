@@ -82,7 +82,7 @@ ReadResult ReadDb::readRange(const RecordRange& range) const {
     const char* column = range.key == RangeKey::Id ? "id" : "initial_time";
     std::string sql =
         "SELECT id, stream_id, address, begin_index, end_index, initial_time, end_time, "
-        "received_begin_time, received_end_time FROM batches WHERE ";
+        "row_count, received_begin_time, received_end_time FROM batches WHERE ";
     sql += column;
     sql += " >= ? AND ";
     sql += column;
@@ -100,7 +100,7 @@ ReadResult ReadDb::readSince(int64_t cursorId, uint8_t streamId) const {
     if (cursorId < 0) return failure("cursor id cannot be negative");
     std::string sql =
         "SELECT id, stream_id, address, begin_index, end_index, initial_time, end_time, "
-        "received_begin_time, received_end_time FROM batches WHERE id > ?";
+        "row_count, received_begin_time, received_end_time FROM batches WHERE id > ?";
     std::vector<int64_t> values{cursorId};
     if (streamId != 0xff) {
         sql += " AND stream_id = ?";
@@ -156,8 +156,9 @@ ReadResult ReadDb::readQuery(const std::string& sql, const std::vector<int64_t>&
         record.endIndex = sqlite3_column_int64(statement, 4);
         record.initialTime = sqlite3_column_int64(statement, 5);
         record.endTime = sqlite3_column_int64(statement, 6);
-        record.receivedBeginTime = sqlite3_column_int64(statement, 7);
-        record.receivedEndTime = sqlite3_column_int64(statement, 8);
+        record.rowCount = sqlite3_column_int64(statement, 7);
+        record.receivedBeginTime = sqlite3_column_int64(statement, 8);
+        record.receivedEndTime = sqlite3_column_int64(statement, 9);
         if (!readBlob(binaryPath_, record.beginIndex, record.endIndex,
                       record.compressedBytes, result.error)) break;
         result.records.push_back(std::move(record));

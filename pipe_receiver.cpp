@@ -53,14 +53,23 @@ int main(int argc, char* argv[]) {
 		if (!producer.ok()) return 1;
 
 		std::thread tabletThread([&tabletServer] { tabletServer.run(); });
+		printf("hiii");
 		receiver.run([&producer, &tabletServer, copyCount](uint8_t streamId, std::vector<uint8_t>&& packet,
-										int64_t receivedBeginTimeMs, int64_t receivedEndTimeMs) {
-			if (tabletServer.isLiveClientConnected()) {
-				tabletServer.offerLivePacket(streamId, packet, receivedBeginTimeMs, receivedEndTimeMs);
-			}
-            for (uint32_t copyIndex = 0; copyIndex < copyCount; ++copyIndex) {
+                                                     int64_t receivedBeginTimeMs, int64_t receivedEndTimeMs) {
+			for (uint32_t copyIndex = 0; copyIndex < copyCount; ++copyIndex) {
                 std::vector<uint8_t> copy = packet;
-                copy[1] = phonepipe::virtualStreamId(streamId, copyIndex);
+				const uint8_t pipeId = phonepipe::virtualStreamId(streamId, copyIndex);
+				copy[1] = pipeId;
+				if (tabletServer.isLiveClientConnected() && packet.size() >= phonepipe::kHeaderSize) {
+					const phonepipe::PacketHeader header = phonepipe::decodeHeader(packet.data());
+					const size_t wireSize = phonepipe::kHeaderSize + header.payloadLen;
+					if (packet.size() >= wireSize) {
+						std::vector<uint8_t> compressedOnly(packet.begin() + phonepipe::kHeaderSize,
+																		 packet.begin() + wireSize);
+						tabletServer.offerLivePacket(pipeId, compressedOnly, receivedBeginTimeMs,
+																	 receivedEndTimeMs, header.rowCount);
+					}
+				}
 				phonepipe::appendReceivedTimes(copy, receivedBeginTimeMs, receivedEndTimeMs);
 				producer.publish(copy[1], std::move(copy));
 			}
@@ -74,13 +83,21 @@ int main(int argc, char* argv[]) {
 
 		std::thread tabletThread([&tabletServer] { tabletServer.run(); });
 		receiver.run([&producer, &tabletServer, copyCount](uint8_t streamId, std::vector<uint8_t>&& packet,
-										int64_t receivedBeginTimeMs, int64_t receivedEndTimeMs) {
-			if (tabletServer.isLiveClientConnected()) {
-				tabletServer.offerLivePacket(streamId, packet, receivedBeginTimeMs, receivedEndTimeMs);
-			}
-            for (uint32_t copyIndex = 0; copyIndex < copyCount; ++copyIndex) {
+                                                     int64_t receivedBeginTimeMs, int64_t receivedEndTimeMs) {
+			for (uint32_t copyIndex = 0; copyIndex < copyCount; ++copyIndex) {
                 std::vector<uint8_t> copy = packet;
-                copy[1] = phonepipe::virtualStreamId(streamId, copyIndex);
+				const uint8_t pipeId = phonepipe::virtualStreamId(streamId, copyIndex);
+				copy[1] = pipeId;
+				if (tabletServer.isLiveClientConnected() && packet.size() >= phonepipe::kHeaderSize) {
+					const phonepipe::PacketHeader header = phonepipe::decodeHeader(packet.data());
+					const size_t wireSize = phonepipe::kHeaderSize + header.payloadLen;
+					if (packet.size() >= wireSize) {
+						std::vector<uint8_t> compressedOnly(packet.begin() + phonepipe::kHeaderSize,
+																		 packet.begin() + wireSize);
+						tabletServer.offerLivePacket(pipeId, compressedOnly, receivedBeginTimeMs,
+																	 receivedEndTimeMs, header.rowCount);
+					}
+				}
 				phonepipe::appendReceivedTimes(copy, receivedBeginTimeMs, receivedEndTimeMs);
 				producer.publish(copy[1], copy);
 			}
