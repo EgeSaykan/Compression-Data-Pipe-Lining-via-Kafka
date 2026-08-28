@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <chrono>
 #include <limits>
 
 #include "openzl/zl_decompress.h"
@@ -26,6 +27,13 @@ const GUID kTabletSppUuid = {
 constexpr size_t kBatchBodySize = 20;
 constexpr size_t kLiveBodySize = 12;
 constexpr size_t kMaxErrorMessage = 1024;
+
+using SteadyClock = std::chrono::steady_clock;
+
+int64_t elapsedMs(SteadyClock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        SteadyClock::now() - start).count();
+}
 
 int64_t recoverRowCount(const std::vector<uint8_t>& compressedBytes) {
     if (compressedBytes.empty()) return 0;
@@ -234,6 +242,7 @@ bool TabletServer::handleRequest(SOCKET client, const std::vector<uint8_t>& payl
 }
 
 bool TabletServer::handleBatch(SOCKET client, const std::vector<uint8_t>& body) {
+    const auto batchStart = SteadyClock::now();
     if (body.size() != kBatchBodySize || body[0] != kProtocolVersion ||
         (body[1] != static_cast<uint8_t>(RequestRangeKey::Id) &&
          body[1] != static_cast<uint8_t>(RequestRangeKey::Timestamp))) {
@@ -245,12 +254,20 @@ bool TabletServer::handleBatch(SOCKET client, const std::vector<uint8_t>& body) 
     range.start = getI64LE(body.data() + 4);
     range.end = getI64LE(body.data() + 12);
     ReadDb reader(databasePath_, binaryPath_);
+    const auto readStart = SteadyClock::now();
     ReadResult result = reader.readRange(range);
+    std::printf("[BatchTiming] readRange records=%zu bytes=%lldms\n",
+                result.records.size(), static_cast<long long>(elapsedMs(readStart)));
     if (!result.ok()) return sendError(client, result.error);
 
     std::printf("Sending %zu historical records\n", result.records.size());
+    size_t totalBytes = 0;
+    int64_t recoveryMs = 0;
+    int64_t sendMs = 0;
     for (const Record& record : result.records) {
+        const auto recordStart = SteadyClock::now();
         const uint32_t rowCount = rowCountForRecord(record);
+        recoveryMs += elapsedMs(recordStart);
         if (rowCount == 0) {
             return sendError(client, "historical record has no valid row count");
         }
@@ -268,10 +285,20 @@ bool TabletServer::handleBatch(SOCKET client, const std::vector<uint8_t>& body) 
         std::copy(record.compressedBytes.begin(), record.compressedBytes.end(), recordBody.begin() + 52);
 
         const auto frame = makeFrame(FrameType::DataRecord, recordBody);
+        const auto sendStart = SteadyClock::now();
         if (frame.empty() || !sendAll(client, frame.data(), frame.size())) return false;
+        sendMs += elapsedMs(sendStart);
+        totalBytes += frame.size();
     }
     const auto end = makeFrame(FrameType::BatchEnd, {kProtocolVersion});
-    return !end.empty() && sendAll(client, end.data(), end.size());
+    const auto endSendStart = SteadyClock::now();
+    const bool sent = !end.empty() && sendAll(client, end.data(), end.size());
+    sendMs += elapsedMs(endSendStart);
+    totalBytes += end.size();
+    std::printf("[BatchTiming] recovery=%lldms send=%lldms total=%lldms bytes=%zu\n",
+                static_cast<long long>(recoveryMs), static_cast<long long>(sendMs),
+                static_cast<long long>(elapsedMs(batchStart)), totalBytes);
+    return sent;
 }
 
 bool TabletServer::handleLive(SOCKET client, const std::vector<uint8_t>& requestBody) {
