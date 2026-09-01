@@ -1,6 +1,3 @@
-
-
-
 #include <winsock2.h>
 #include <ws2bth.h>
 #include <windows.h>
@@ -13,6 +10,8 @@
 
 #include "bluetooth_receiver.h"
 #include "wire_protocol.h"
+#include "gzip_codec.h"
+#include "openzl_codec.h"
 
 
 #pragma comment(lib, "Ws2_32.lib")
@@ -28,6 +27,44 @@ int64_t utcNowMs() {
     const uint64_t windowsTime = (static_cast<uint64_t>(fileTime.dwHighDateTime) << 32) |
                                  fileTime.dwLowDateTime;
     return static_cast<int64_t>(windowsTime / 10000ULL - 11644473600000ULL);
+}
+
+// Rewrites `packet` in place so its flag becomes OPENZL, converting RAW and
+// GZIP payloads to OpenZL-compressed form before anything downstream (tablet
+// server / Kafka / RabbitMQ) ever sees them. Already-OPENZL packets pass
+// through untouched. On failure, leaves `packet` as-is and logs to stderr.
+void normalizeToOpenZL(std::vector<uint8_t>& packet) {
+    if (packet.size() < kHeaderSize) return;
+    PacketHeader hdr = decodeHeader(packet.data());
+    if (hdr.flag == CompressionFlag::OPENZL) return;
+
+    const uint8_t* payload = packet.data() + kHeaderSize;
+    std::vector<uint8_t> compressed;
+
+    if (hdr.flag == CompressionFlag::GZIP) {
+        std::vector<uint8_t> raw = gzipDecompress(payload, hdr.payloadLen);
+        if (raw.empty()) {
+            fprintf(stderr, "normalizeToOpenZL: gzip decompress failed for stream %u\n", hdr.streamId);
+            return;
+        }
+        compressed = openzlCompressFresh(raw.data(), raw.size(), static_cast<int>(hdr.rowCount));
+    } else { // RAW -- already delta-encoded on-device, entropy-compress only
+        compressed = openzlCompressDeltaEncoded(payload, hdr.payloadLen, static_cast<int>(hdr.rowCount));
+    }
+
+    if (compressed.empty()) {
+        fprintf(stderr, "normalizeToOpenZL: OpenZL compression failed for stream %u, forwarding as-is\n",
+                hdr.streamId);
+        return;
+    }
+
+    hdr.flag = CompressionFlag::OPENZL;
+    hdr.payloadLen = static_cast<uint32_t>(compressed.size());
+
+    std::vector<uint8_t> rebuilt(kHeaderSize + compressed.size());
+    encodeHeader(rebuilt.data(), hdr);
+    std::memcpy(rebuilt.data() + kHeaderSize, compressed.data(), compressed.size());
+    packet = std::move(rebuilt);
 }
 
 }
@@ -192,9 +229,16 @@ void BluetoothReceiver::run(const PacketHandler& handler) {
                 continue;
             }
 
-            printf("[%s] %u rows, %u bytes\n", streamName(packetHeader.streamId),
-                   packetHeader.rowCount, packetHeader.payloadLen);
-            handler(packetHeader.streamId, std::move(packet),
+            // Normalize RAW/GZIP -> OPENZL before this packet goes anywhere
+            // else (tablet server, Kafka, RabbitMQ all expect OpenZL from
+            // here on). Must happen before handler(...) below.
+            normalizeToOpenZL(packet);
+            const PacketHeader finalHeader = decodeHeader(packet.data());
+
+            printf("[%s] %u rows, %u bytes (%s -> %s)\n", streamName(finalHeader.streamId),
+                   finalHeader.rowCount, finalHeader.payloadLen,
+                   compressionName(packetHeader.flag), compressionName(finalHeader.flag));
+            handler(finalHeader.streamId, std::move(packet),
                 receivedBeginTimeMs, receivedEndTimeMs);
         }
 

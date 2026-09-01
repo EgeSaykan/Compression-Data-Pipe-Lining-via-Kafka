@@ -51,6 +51,8 @@
 #include <memory>
 
 #include "wire_protocol.h"
+#include "gzip_codec.h"
+#include "openzl_codec.h"
 
 #include <librdkafka/rdkafkacpp.h>
 #include <sqlite3.h>
@@ -371,18 +373,32 @@ private:
 
         std::vector<uint8_t> compressedBytes;
 
-        if (hdr.compressed) {
-            // Already OpenZL-compressed on the phone -- store as-is.
+        if (hdr.flag == CompressionFlag::OPENZL) {
+            // Already normalized on the receiver; keep the payload as-is.
             compressedBytes.assign(payloadPtr, payloadPtr + payloadLen);
-        } else {
-            // Raw (delta-encoded) columnar payload -- compress here so the
-            // binary file always holds a uniformly compressed stream.
-            std::vector<uint8_t> raw(payloadPtr, payloadPtr + hdr.payloadLen);
-            compressedBytes = compressColumns(raw, hdr.rowCount);
+        } else if (hdr.flag == CompressionFlag::RAW) {
+            // Raw delta-encoded columnar payload: compress to OpenZL before writing.
+            compressedBytes = openzlCompressDeltaEncoded(payloadPtr, payloadLen, static_cast<int>(hdr.rowCount));
             if (compressedBytes.empty()) {
-                fprintf(stderr, "compress-on-ingest failed, dropping batch\n");
+                fprintf(stderr, "openzl compress of raw payload failed, dropping batch\n");
                 return;
             }
+        } else if (hdr.flag == CompressionFlag::GZIP) {
+            // GZIP packets carry the plain (non-delta-encoded) columnar buffer.
+            std::vector<uint8_t> raw = gzipDecompress(payloadPtr, payloadLen);
+            if (raw.empty()) {
+                fprintf(stderr, "gzip decompress failed for stream %u, dropping batch\n", hdr.streamId);
+                return;
+            }
+            compressedBytes = openzlCompressFresh(raw.data(), raw.size(), static_cast<int>(hdr.rowCount));
+            if (compressedBytes.empty()) {
+                fprintf(stderr, "openzl compress of gzip payload failed, dropping batch\n");
+                return;
+            }
+        } else {
+            fprintf(stderr, "unknown effective compression flag %u for stream %u, dropping batch\n",
+                    static_cast<unsigned>(hdr.flag), hdr.streamId);
+            return;
         }
 
         // Append to this stream's binary file and record the byte range.

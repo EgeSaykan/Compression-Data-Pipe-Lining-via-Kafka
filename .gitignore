@@ -1,6 +1,7 @@
 
 # libraries
 openzl/
+rabbitmq-c/
 lib*
 sqlite*
 

@@ -17,19 +17,19 @@ SQLITE_LIBS := -lsqlite3
 
 all: pipe_receiver.exe kafka_db_writer.exe rabbitmq_db_writer.exe
 
-pipe_receiver.exe: pipe_receiver.cpp bluetooth_receiver.cpp bluetooth_receiver.h client_bluetooth.cpp client_bluetooth.h read_db.cpp read_db.h tablet_protocol.h kafka_producer.cpp kafka_producer.h rabbit_producer.cpp rabbit_producer.h wire_protocol.h
+pipe_receiver.exe: pipe_receiver.cpp bluetooth_receiver.cpp bluetooth_receiver.h client_bluetooth.cpp client_bluetooth.h read_db.cpp read_db.h tablet_protocol.h kafka_producer.cpp kafka_producer.h rabbit_producer.cpp rabbit_producer.h wire_protocol.h gzip_codec.cpp gzip_codec.h openzl_codec.cpp openzl_codec.h
 	$(CXX) $(COMMON_CXXFLAGS) $(LIBRDKAFKA_INCLUDE) $(LIBRDKAFKA_LIBRARY) $(COMMON_LDFLAGS) -DLIBRDKAFKA_STATICLIB \
-		pipe_receiver.cpp bluetooth_receiver.cpp client_bluetooth.cpp read_db.cpp kafka_producer.cpp rabbit_producer.cpp -o $@ \
+		pipe_receiver.cpp bluetooth_receiver.cpp client_bluetooth.cpp read_db.cpp kafka_producer.cpp rabbit_producer.cpp gzip_codec.cpp openzl_codec.cpp -o $@ \
 		$(LIBRDKAFKA_LIBS) $(RABBITMQ_LIBS) $(OPENZL_LIBS) $(COMMON_CRYPTO_LIBS) $(SQLITE_LIBS) $(WINDOWS_LIBS) -lbthprops
 
-kafka_db_writer.exe: kafka_db_writer.cpp wire_protocol.h
+kafka_db_writer.exe: kafka_db_writer.cpp wire_protocol.h gzip_codec.cpp gzip_codec.h openzl_codec.cpp openzl_codec.h
 	$(CXX) $(COMMON_CXXFLAGS) $(LIBRDKAFKA_INCLUDE) $(LIBRDKAFKA_LIBRARY) $(COMMON_LDFLAGS) -DLIBRDKAFKA_STATICLIB \
-		kafka_db_writer.cpp -o $@ \
+		kafka_db_writer.cpp gzip_codec.cpp openzl_codec.cpp -o $@ \
 		$(LIBRDKAFKA_LIBS) $(OPENZL_LIBS) $(COMMON_CRYPTO_LIBS) $(SQLITE_LIBS) $(WINDOWS_LIBS)
 
-rabbitmq_db_writer.exe: rabbitmq_db_writer.cpp wire_protocol.h
+rabbitmq_db_writer.exe: rabbitmq_db_writer.cpp wire_protocol.h gzip_codec.cpp gzip_codec.h openzl_codec.cpp openzl_codec.h
 	$(CXX) $(COMMON_CXXFLAGS) $(COMMON_LDFLAGS) \
-		rabbitmq_db_writer.cpp -o $@ \
+		rabbitmq_db_writer.cpp gzip_codec.cpp openzl_codec.cpp -o $@ \
 		$(RABBITMQ_LIBS) $(OPENZL_LIBS) $(COMMON_CRYPTO_LIBS) $(SQLITE_LIBS) $(WINDOWS_LIBS)
 
 read_db_test.exe: read_db.cpp read_db_test.cpp read_db.h sqlite3_test.o

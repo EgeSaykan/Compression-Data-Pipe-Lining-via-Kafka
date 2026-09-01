@@ -1,6 +1,7 @@
-
-
-
+// UNCHANGED from your original. Normalization (raw/gzip -> OpenZL) now
+// happens once, inside BluetoothReceiver::run (see bluetooth_receiver.cpp),
+// before the handler lambda below ever runs -- so every packet this file
+// touches is already OpenZL-compressed regardless of what the phone sent.
 
 #include <cstdio>
 #include <cstdlib>
@@ -50,7 +51,10 @@ int main(int argc, char* argv[]) {
 	if (std::string(argv[1]) == "--kafka") {
 		const char* configuredBrokers = std::getenv("KAFKA_BROKERS");
 		KafkaBatchProducer producer(configuredBrokers ? configuredBrokers : "localhost:9092");
-		if (!producer.ok()) return 1;
+		if (!producer.ok()) { 
+			printf("Docker probs");
+			return 1;
+		}
 
 		std::thread tabletThread([&tabletServer] { tabletServer.run(); });
 		printf("hiii");
@@ -79,7 +83,12 @@ int main(int argc, char* argv[]) {
 		tabletThread.join();
 	} else {
 		RabbitBatchProducer producer;
-		if (!producer.ok()) return 1;
+		printf("here1");
+		if (!producer.ok()) { 
+			printf("Docker probs");
+			return 1;
+		}
+		printf("here2");
 
 		std::thread tabletThread([&tabletServer] { tabletServer.run(); });
 		receiver.run([&producer, &tabletServer, copyCount](uint8_t streamId, std::vector<uint8_t>&& packet,
@@ -108,4 +117,3 @@ int main(int argc, char* argv[]) {
 
 	return 0;
 }
-

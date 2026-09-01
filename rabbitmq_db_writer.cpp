@@ -14,10 +14,9 @@
 #include <vector>
 
 #include "wire_protocol.h"
+#include "gzip_codec.h"
+#include "openzl_codec.h"
 #include <sqlite3.h>
-#include "openzl/zl_compress.h"
-#include "openzl/zl_compressor.h"
-#include "openzl/zl_errors.h"
 
 using namespace phonepipe;
 
@@ -32,54 +31,6 @@ bool rabbitOk(amqp_rpc_reply_t reply, const char* operation) {
     if (reply.reply_type == AMQP_RESPONSE_NORMAL) return true;
     fprintf(stderr, "RabbitMQ %s failed (reply type %d)\n", operation, reply.reply_type);
     return false;
-}
-
-std::vector<uint8_t> compressColumns(const std::vector<uint8_t>& rawPayload, uint32_t rowCount) {
-    const size_t columnBytes = static_cast<size_t>(rowCount) * kColWidth;
-    const size_t expectedSize = static_cast<size_t>(kFieldCount) * columnBytes;
-    if (rawPayload.size() != expectedSize || expectedSize == 0) return {};
-
-    ZL_Compressor* compressor = ZL_Compressor_create();
-    if (!compressor) return {};
-    ZL_Report report = ZL_Compressor_setParameter(
-        compressor, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION);
-    if (!ZL_isError(report)) {
-        report = ZL_Compressor_selectStartingGraphID(compressor, ZL_GRAPH_COMPRESS_GENERIC);
-    }
-    ZL_CCtx* context = ZL_CCtx_create();
-    if (!context || ZL_isError(report)) {
-        if (context) ZL_CCtx_free(context);
-        ZL_Compressor_free(compressor);
-        return {};
-    }
-    report = ZL_CCtx_refCompressor(context, compressor);
-
-    std::vector<int64_t> alignedData(expectedSize / sizeof(int64_t));
-    std::memcpy(alignedData.data(), rawPayload.data(), expectedSize);
-    std::vector<ZL_TypedRef*> inputs(kFieldCount, nullptr);
-    bool inputsReady = !ZL_isError(report);
-    for (int column = 0; column < kFieldCount && inputsReady; ++column) {
-        inputs[column] = ZL_TypedRef_createNumeric(
-            reinterpret_cast<uint8_t*>(alignedData.data()) + column * columnBytes,
-            sizeof(int64_t), rowCount);
-        if (!inputs[column]) inputsReady = false;
-    }
-
-    std::vector<const ZL_TypedRef*> typedInputs(inputs.begin(), inputs.end());
-    std::vector<uint8_t> output(expectedSize + expectedSize / 2 + 4096);
-    if (inputsReady && !ZL_isError(report)) {
-        report = ZL_CCtx_compressMultiTypedRef(
-            context, output.data(), output.size(), typedInputs.data(), typedInputs.size());
-    }
-
-    std::vector<uint8_t> result;
-    if (!ZL_isError(report)) result.assign(output.begin(), output.begin() + ZL_validResult(report));
-    for (ZL_TypedRef* input : inputs) {
-        if (input) ZL_TypedRef_free(input);
-    }
-    ZL_CCtx_free(context);
-    ZL_Compressor_free(compressor);
-    return result;
 }
 
 sqlite3* openDb(const std::string& path) {
@@ -225,9 +176,29 @@ private:
         const int64_t receivedEndTime = length == wireSize + kReceivedTimeSize
             ? getReceivedEndTimeMs(raw, wireSize) : receivedBeginTime;
 
-        std::vector<uint8_t> payload(raw + kHeaderSize, raw + wireSize);
-        std::vector<uint8_t> compressed = header.compressed
-            ? std::move(payload) : compressColumns(payload, header.rowCount);
+        const uint8_t* payloadPtr = raw + kHeaderSize;
+        std::vector<uint8_t> compressed;
+        if (header.flag == CompressionFlag::OPENZL) {
+            // Already normalized on the receiver; keep the payload as-is.
+            compressed.assign(payloadPtr, payloadPtr + header.payloadLen);
+        } else if (header.flag == CompressionFlag::RAW) {
+            // Raw delta-encoded columnar payload: compress to OpenZL before writing.
+            compressed = openzlCompressDeltaEncoded(payloadPtr, header.payloadLen,
+                                                     static_cast<int>(header.rowCount));
+        } else if (header.flag == CompressionFlag::GZIP) {
+            // GZIP packets carry the plain (non-delta-encoded) columnar buffer.
+            std::vector<uint8_t> decompressed = gzipDecompress(payloadPtr, header.payloadLen);
+            if (decompressed.empty()) {
+                fprintf(stderr, "gzip decompress failed for stream %u\n", header.streamId);
+                return false;
+            }
+            compressed = openzlCompressFresh(decompressed.data(), decompressed.size(),
+                                              static_cast<int>(header.rowCount));
+        } else {
+            fprintf(stderr, "unknown compression flag %u for stream %u\n",
+                    static_cast<unsigned>(header.flag), header.streamId);
+            return false;
+        }
         if (compressed.empty()) return false;
         if (fseek(dataFile_, 0, SEEK_END) != 0) return false;
         const long begin = ftell(dataFile_);

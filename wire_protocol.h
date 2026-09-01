@@ -6,10 +6,12 @@
 // two programs can never drift out of sync on the packet layout.
 //
 // Packet layout (unchanged fields keep their original byte offsets;
-// initialTimeMs/endTimeMs are new and always sent UNCOMPRESSED,
-// regardless of the compressed flag in byte 0):
+// initialTimeMs/endTimeMs are always sent UNCOMPRESSED, regardless of
+// the compression flag in byte 0):
 //
-//   byte 0        : 0x01 = OpenZL compressed, 0x00 = raw columnar (delta-encoded)
+//   byte 0        : CompressionFlag -- 0x00 = raw columnar (delta-encoded),
+//                                       0x01 = OpenZL compressed,
+//                                       0x02 = gzip compressed (NOT delta-encoded)
 //   byte 1        : virtual streamId (even IDs = green, odd IDs = pink)
 //   bytes 2..5    : rowCount             uint32 big-endian
 //   bytes 6..9    : payloadLen           uint32 big-endian
@@ -17,8 +19,11 @@
 //   bytes 18..25  : endTimeMs            int64  big-endian (timestamp of last row in batch)
 //   bytes 26..    : payload (payloadLen bytes)
 //
-// Raw columnar payload (when byte 0 == 0x00), each column delta-encoded
-// on-device before sending:
+// Raw columnar payload (when byte 0 == RAW), each column delta-encoded
+// on-device before sending. Gzip payload (byte 0 == GZIP) is the gzip of
+// the plain (non-delta-encoded) columnar buffer -- see BluetoothReceiver::run,
+// which normalizes both RAW and GZIP packets to OPENZL before they're
+// handed to the tablet server / Kafka / RabbitMQ.
 //
 //   column 0 : timestamp          int64_t[rowCount]
 //   column 1 : temp               int64_t[rowCount]
@@ -48,6 +53,13 @@ constexpr size_t kColWidth   = 8;
 constexpr uint8_t STREAM_GREEN = 0;
 constexpr uint8_t STREAM_PINK  = 1;
 
+// Matches CompressionMode.kt / BluetoothSender.kt's FLAG_* constants on the phone.
+enum class CompressionFlag : uint8_t {
+    RAW    = 0x00,
+    OPENZL = 0x01,
+    GZIP   = 0x02,
+};
+
 inline bool isValidStream(uint8_t streamId) {
     return streamId <= 255;
 }
@@ -61,7 +73,7 @@ inline uint8_t virtualStreamId(uint8_t parentId, uint32_t copyIndex) {
 }
 
 struct PacketHeader {
-    bool     compressed = false;
+    CompressionFlag flag = CompressionFlag::RAW;
     uint8_t  streamId = 0;
     uint32_t rowCount = 0;
     uint32_t payloadLen = 0;
@@ -115,7 +127,7 @@ inline int64_t getReceivedEndTimeMs(const uint8_t* packet, size_t offset) {
 
 inline PacketHeader decodeHeader(const uint8_t* h) {
     PacketHeader hdr;
-    hdr.compressed    = h[0] == 0x01;
+    hdr.flag          = static_cast<CompressionFlag>(h[0]);
     hdr.streamId      = h[1];
     hdr.rowCount      = getU32BE(h + 2);
     hdr.payloadLen    = getU32BE(h + 6);
@@ -125,7 +137,7 @@ inline PacketHeader decodeHeader(const uint8_t* h) {
 }
 
 inline void encodeHeader(uint8_t* h, const PacketHeader& hdr) {
-    h[0] = hdr.compressed ? 0x01 : 0x00;
+    h[0] = static_cast<uint8_t>(hdr.flag);
     h[1] = hdr.streamId;
     putU32BE(h + 2, hdr.rowCount);
     putU32BE(h + 6, hdr.payloadLen);
@@ -136,6 +148,15 @@ inline void encodeHeader(uint8_t* h, const PacketHeader& hdr) {
 inline const char* streamName(uint8_t streamId) {
     if (parentStream(streamId) == STREAM_GREEN) return "green";
     if (parentStream(streamId) == STREAM_PINK)  return "pink";
+    return "unknown";
+}
+
+inline const char* compressionName(CompressionFlag flag) {
+    switch (flag) {
+        case CompressionFlag::RAW:    return "raw";
+        case CompressionFlag::OPENZL: return "openzl";
+        case CompressionFlag::GZIP:   return "gzip";
+    }
     return "unknown";
 }
 
