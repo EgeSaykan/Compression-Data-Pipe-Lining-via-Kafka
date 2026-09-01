@@ -247,4 +247,4 @@ void BluetoothReceiver::run(const PacketHandler& handler) {
     }
 }
 
-} // namespace phonepipe
+}
