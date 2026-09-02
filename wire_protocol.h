@@ -5,9 +5,7 @@
 // kafka_db_writer.cpp (Kafka -> binary file + SQLite consumer), so the
 // two programs can never drift out of sync on the packet layout.
 //
-// Packet layout (unchanged fields keep their original byte offsets;
-// initialTimeMs/endTimeMs are always sent UNCOMPRESSED, regardless of
-// the compression flag in byte 0):
+// Packet layout (unchanged fields keep their original byte offsets):
 //
 //   byte 0        : CompressionFlag -- 0x00 = raw columnar (delta-encoded),
 //                                       0x01 = OpenZL compressed,
@@ -15,9 +13,7 @@
 //   byte 1        : virtual streamId (even IDs = green, odd IDs = pink)
 //   bytes 2..5    : rowCount             uint32 big-endian
 //   bytes 6..9    : payloadLen           uint32 big-endian
-//   bytes 10..17  : initialTimeMs        int64  big-endian (timestamp of first row in batch)
-//   bytes 18..25  : endTimeMs            int64  big-endian (timestamp of last row in batch)
-//   bytes 26..    : payload (payloadLen bytes)
+//   bytes 10..    : payload (payloadLen bytes)
 //
 // Raw columnar payload (when byte 0 == RAW), each column delta-encoded
 // on-device before sending. Gzip payload (byte 0 == GZIP) is the gzip of
@@ -44,7 +40,7 @@
 
 namespace phonepipe {
 
-constexpr size_t kHeaderSize = 26;
+constexpr size_t kHeaderSize = 10;
 constexpr size_t kLegacyReceivedTimeSize = 8;
 constexpr size_t kReceivedTimeSize = 16;
 constexpr int    kFieldCount = 9;
@@ -77,8 +73,6 @@ struct PacketHeader {
     uint8_t  streamId = 0;
     uint32_t rowCount = 0;
     uint32_t payloadLen = 0;
-    int64_t  initialTimeMs = 0;
-    int64_t  endTimeMs = 0;
 };
 
 inline void putU32BE(uint8_t* p, uint32_t v) {
@@ -127,12 +121,10 @@ inline int64_t getReceivedEndTimeMs(const uint8_t* packet, size_t offset) {
 
 inline PacketHeader decodeHeader(const uint8_t* h) {
     PacketHeader hdr;
-    hdr.flag          = static_cast<CompressionFlag>(h[0]);
-    hdr.streamId      = h[1];
-    hdr.rowCount      = getU32BE(h + 2);
-    hdr.payloadLen    = getU32BE(h + 6);
-    hdr.initialTimeMs = getI64BE(h + 10);
-    hdr.endTimeMs     = getI64BE(h + 18);
+    hdr.flag       = static_cast<CompressionFlag>(h[0]);
+    hdr.streamId   = h[1];
+    hdr.rowCount   = getU32BE(h + 2);
+    hdr.payloadLen = getU32BE(h + 6);
     return hdr;
 }
 
@@ -141,8 +133,6 @@ inline void encodeHeader(uint8_t* h, const PacketHeader& hdr) {
     h[1] = hdr.streamId;
     putU32BE(h + 2, hdr.rowCount);
     putU32BE(h + 6, hdr.payloadLen);
-    putI64BE(h + 10, hdr.initialTimeMs);
-    putI64BE(h + 18, hdr.endTimeMs);
 }
 
 inline const char* streamName(uint8_t streamId) {

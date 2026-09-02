@@ -79,34 +79,25 @@ ReadResult ReadDb::readRange(const RecordRange& range) const {
     if (range.key != RangeKey::Id && range.key != RangeKey::Timestamp) {
         return failure("unsupported range key");
     }
-    const char* column = range.key == RangeKey::Id ? "id" : "initial_time";
-    std::string sql =
-        "SELECT id, stream_id, address, begin_index, end_index, initial_time, end_time, "
-        "row_count, received_begin_time, received_end_time FROM batches WHERE ";
-    sql += column;
-    sql += " >= ? AND ";
-    sql += column;
-    sql += " <= ?";
+
+    const char* column = range.key == RangeKey::Id ? "id" : "timestamp";
+    const std::string sql =
+        "SELECT id, stream_id, address, row_count, received_begin_time, received_end_time, timestamp "
+        "FROM sensor_rows WHERE " + std::string(column) + " >= ? AND " + std::string(column) + " <= ?" +
+        (range.streamId != 0xff ? " AND stream_id = ?" : "") + " ORDER BY id ASC;";
     std::vector<int64_t> values{range.start, range.end};
-    if (range.streamId != 0xff) {
-        sql += " AND stream_id = ?";
-        values.push_back(range.streamId);
-    }
-    sql += " ORDER BY id ASC;";
+    if (range.streamId != 0xff) values.push_back(range.streamId);
     return readQuery(sql, values);
 }
 
 ReadResult ReadDb::readSince(int64_t cursorId, uint8_t streamId) const {
     if (cursorId < 0) return failure("cursor id cannot be negative");
-    std::string sql =
-        "SELECT id, stream_id, address, begin_index, end_index, initial_time, end_time, "
-        "row_count, received_begin_time, received_end_time FROM batches WHERE id > ?";
+    const std::string sql =
+        "SELECT id, stream_id, address, row_count, received_begin_time, received_end_time, timestamp "
+        "FROM sensor_rows WHERE id > ?" +
+        std::string(streamId != 0xff ? " AND stream_id = ?" : "") + " ORDER BY id ASC;";
     std::vector<int64_t> values{cursorId};
-    if (streamId != 0xff) {
-        sql += " AND stream_id = ?";
-        values.push_back(streamId);
-    }
-    sql += " ORDER BY id ASC;";
+    if (streamId != 0xff) values.push_back(streamId);
     return readQuery(sql, values);
 }
 
@@ -114,10 +105,13 @@ bool ReadDb::maxId(int64_t& id, std::string& error) const {
     DbHandle db(databasePath_);
     if (!db.get()) { error = db.error(); return false; }
     sqlite3_stmt* statement = nullptr;
-    if (sqlite3_prepare_v2(db.get(), "SELECT COALESCE(MAX(id), 0) FROM batches;", -1,
+    if (sqlite3_prepare_v2(db.get(), "SELECT COALESCE(MAX(id), 0) FROM sensor_rows;", -1,
                            &statement, nullptr) != SQLITE_OK) {
-        error = sqlite3_errmsg(db.get());
-        return false;
+        if (sqlite3_prepare_v2(db.get(), "SELECT COALESCE(MAX(id), 0) FROM batches;", -1,
+                               &statement, nullptr) != SQLITE_OK) {
+            error = sqlite3_errmsg(db.get());
+            return false;
+        }
     }
     const bool ok = sqlite3_step(statement) == SQLITE_ROW;
     if (ok) id = sqlite3_column_int64(statement, 0);
@@ -152,15 +146,10 @@ ReadResult ReadDb::readQuery(const std::string& sql, const std::vector<int64_t>&
         record.streamId = static_cast<uint8_t>(sqlite3_column_int(statement, 1));
         const unsigned char* address = sqlite3_column_text(statement, 2);
         record.address = address ? reinterpret_cast<const char*>(address) : "";
-        record.beginIndex = sqlite3_column_int64(statement, 3);
-        record.endIndex = sqlite3_column_int64(statement, 4);
-        record.initialTime = sqlite3_column_int64(statement, 5);
-        record.endTime = sqlite3_column_int64(statement, 6);
-        record.rowCount = sqlite3_column_int64(statement, 7);
-        record.receivedBeginTime = sqlite3_column_int64(statement, 8);
-        record.receivedEndTime = sqlite3_column_int64(statement, 9);
-        if (!readBlob(binaryPath_, record.beginIndex, record.endIndex,
-                      record.compressedBytes, result.error)) break;
+        record.rowCount = sqlite3_column_int64(statement, 3);
+        record.receivedBeginTime = sqlite3_column_int64(statement, 4);
+        record.receivedEndTime = sqlite3_column_int64(statement, 5);
+        record.timestamp = sqlite3_column_int64(statement, 6);
         result.records.push_back(std::move(record));
     }
     sqlite3_finalize(statement);

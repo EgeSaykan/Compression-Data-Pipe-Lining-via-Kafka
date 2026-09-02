@@ -57,7 +57,6 @@ int main(int argc, char* argv[]) {
 		}
 
 		std::thread tabletThread([&tabletServer] { tabletServer.run(); });
-		printf("hiii");
 		receiver.run([&producer, &tabletServer, copyCount](uint8_t streamId, std::vector<uint8_t>&& packet,
                                                      int64_t receivedBeginTimeMs, int64_t receivedEndTimeMs) {
 			for (uint32_t copyIndex = 0; copyIndex < copyCount; ++copyIndex) {

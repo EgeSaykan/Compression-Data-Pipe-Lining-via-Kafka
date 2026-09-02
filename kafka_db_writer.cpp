@@ -1,44 +1,7 @@
 // kafka_db_writer.cpp
 //
-// Consumes green/pink sensor batches from Kafka (topics written by
-// receiver.cpp) and persists them as:
-//
-//   - a per-stream append-only binary file holding the OpenZL-compressed
-//     payload of every batch back to back (data/green.bin, data/pink.bin)
-//   - a SQLite row per batch recording where that batch lives in the
-//     binary file and what time range it covers:
-//
-//       CREATE TABLE batches (
-//         id            INTEGER PRIMARY KEY AUTOINCREMENT,
-//         address       TEXT    NOT NULL,   -- stream name, e.g. "green"/"pink"
-//         begin_index   INTEGER NOT NULL,   -- byte offset of this batch in the .bin file
-//         end_index     INTEGER NOT NULL,   -- byte offset just past this batch
-//         initial_time  INTEGER NOT NULL,   -- epoch ms of first row in the batch
-//         end_time      INTEGER NOT NULL    -- epoch ms of last row in the batch
-//       );
-//
-// To read a batch back later: look up its row, open the stream's .bin
-// file, seek to begin_index, read (end_index - begin_index) bytes, and
-// run the same OpenZL decompress used in the old receiver.cpp to get
-// back the SensorRow columns.
-//
-// STREAM ISOLATION: green and pink each get their own Kafka consumer,
-// own .bin file, and own SQLite connection (WAL mode), running on their
-// own std::thread. There is no shared queue, lock, or file between them,
-// so a slow disk write or a burst on one stream cannot delay the other.
-// SQLite WAL still serializes the (very short) INSERT transactions
-// against each other, but that's sub-millisecond and never blocks the
-// much larger compress/append work happening concurrently.
-//
-// Build deps (vcpkg): librdkafka, sqlite3, plus your OpenZL build.
-//   vcpkg install librdkafka sqlite3
-//
-// NOTE: compressColumns() below mirrors decompressColumns() from the
-// original receiver.cpp (which used ZL_DCtx_decompressMultiTBuffer) but
-// for the forward/compress direction. Double check the exact OpenZL
-// compress entry points (ZL_CCtx_create / ZL_CCtx_compressMultiTBuffer
-// or whatever your installed OpenZL version calls them) against your
-// headers -- I don't have zl_compress.h to confirm exact symbol names.
+// Consumes sensor batches from Kafka and writes decoded rows to SQLite only.
+// This path deliberately drops the older binary-file staging approach.
 
 #include <windows.h>
 
@@ -57,132 +20,180 @@
 #include <librdkafka/rdkafkacpp.h>
 #include <sqlite3.h>
 
-#include "openzl/zl_compress.h"   // ZL_CCtx_create, ZL_CCtx_compressMultiTBuffer, etc.
-#include "openzl/zl_compressor.h"
-#include "openzl/zl_decompress.h" // kept in case you want to sanity-check on read-back
+#include "openzl/zl_decompress.h"
 #include "openzl/zl_errors.h"
 
 using namespace phonepipe;
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// OpenZL compress: takes the delta-encoded raw columnar payload (exactly
-// what the phone sends when it can't/won't compress) and produces the
-// same compressed format decompressColumns() in the original receiver.cpp
-// expects to read back.
-// ---------------------------------------------------------------------------
-std::vector<uint8_t> compressColumns(const std::vector<uint8_t>& rawPayload, uint32_t rowCount) {
+struct SensorRow {
+    int64_t timestamp = 0;
+    int64_t temp = 0;
+    int64_t pressure = 0;
+    int64_t flowRate = 0;
+    int64_t massFlow = 0;
+    int64_t volumeFlow = 0;
+    int64_t density = 0;
+    int64_t currentOfMotor = 0;
+    int64_t percentageOfValve = 0;
+};
+
+void deltaDecodeInPlace(int64_t* col, int rowCount) {
+    for (int i = 1; i < rowCount; ++i) {
+        col[i] = col[i] + col[i - 1];
+    }
+}
+
+std::vector<SensorRow> parseRawColumnar(const uint8_t* data, size_t len, uint32_t rowCount) {
+    const size_t expectedBytes = static_cast<size_t>(kFieldCount) * kColWidth * rowCount;
+    if (len != expectedBytes) {
+        fprintf(stderr, "parseRawColumnar: invalid payload size %zu (expected %zu for %u rows)\n",
+                len, expectedBytes, rowCount);
+        return {};
+    }
+
+    std::vector<int64_t> rawData(reinterpret_cast<const int64_t*>(data),
+                                 reinterpret_cast<const int64_t*>(data + len));
     const size_t colBytes = static_cast<size_t>(rowCount) * kColWidth;
-    const size_t expectedSize = static_cast<size_t>(kFieldCount) * colBytes;
-
-    if (rawPayload.size() != expectedSize) {
-        fprintf(stderr, "compressColumns: unexpected payload size %zu (expected %zu)\n",
-                rawPayload.size(), expectedSize);
-        return {};
-    }
-
-    ZL_Compressor* compressor = ZL_Compressor_create();
-    if (!compressor) {
-        fprintf(stderr, "OpenZL compressor creation failed\n");
-        return {};
-    }
-
-    ZL_Report report = ZL_Compressor_setParameter(
-        compressor, ZL_CParam_formatVersion, ZL_MAX_FORMAT_VERSION);
-    if (ZL_isError(report)) {
-        fprintf(stderr, "OpenZL format setup failed: %s\n",
-                ZL_Compressor_getErrorContextString(compressor, report));
-        ZL_Compressor_free(compressor);
-        return {};
-    }
-
-    report = ZL_Compressor_selectStartingGraphID(
-        compressor, ZL_GRAPH_COMPRESS_GENERIC);
-    if (ZL_isError(report)) {
-        fprintf(stderr, "OpenZL graph setup failed: %s\n",
-                ZL_Compressor_getErrorContextString(compressor, report));
-        ZL_Compressor_free(compressor);
-        return {};
-    }
-
-    ZL_CCtx* cctx = ZL_CCtx_create();
-    if (!cctx) {
-        fprintf(stderr, "OpenZL compression context creation failed\n");
-        ZL_Compressor_free(compressor);
-        return {};
-    }
-
-    report = ZL_CCtx_refCompressor(cctx, compressor);
-    if (ZL_isError(report)) {
-        fprintf(stderr, "OpenZL compressor attachment failed: %s\n",
-                ZL_CCtx_getErrorContextString(cctx, report));
-        ZL_CCtx_free(cctx);
-        ZL_Compressor_free(compressor);
-        return {};
-    }
-
-    // Match the app: typed numeric references must point to 8-byte-aligned
-    // storage. The payload is already delta-encoded by the app.
-    std::vector<int64_t> alignedData(expectedSize / sizeof(int64_t));
-    std::memcpy(alignedData.data(), rawPayload.data(), expectedSize);
-
-    std::vector<ZL_TypedRef*> inputs(kFieldCount, nullptr);
     for (int c = 0; c < kFieldCount; ++c) {
-        const size_t offset = static_cast<size_t>(c) * colBytes;
-        inputs[c] = ZL_TypedRef_createNumeric(
-            reinterpret_cast<uint8_t*>(alignedData.data()) + offset,
-            sizeof(int64_t),
-            rowCount);
-        if (!inputs[c]) {
-            fprintf(stderr, "OpenZL typed input creation failed for column %d\n", c);
-            for (auto* ref : inputs) {
-                if (ref) ZL_TypedRef_free(ref);
+        int64_t* col = rawData.data() + static_cast<size_t>(c) * rowCount;
+        deltaDecodeInPlace(col, static_cast<int>(rowCount));
+    }
+
+    std::vector<SensorRow> rows(rowCount);
+    const int64_t* timestamps = rawData.data();
+    const int64_t* temp = timestamps + rowCount;
+    const int64_t* pressure = temp + rowCount;
+    const int64_t* flowRate = pressure + rowCount;
+    const int64_t* massFlow = flowRate + rowCount;
+    const int64_t* volumeFlow = massFlow + rowCount;
+    const int64_t* density = volumeFlow + rowCount;
+    const int64_t* currentOfMotor = density + rowCount;
+    const int64_t* percentageOfValve = currentOfMotor + rowCount;
+
+    for (uint32_t i = 0; i < rowCount; ++i) {
+        rows[i].timestamp = timestamps[i];
+        rows[i].temp = temp[i];
+        rows[i].pressure = pressure[i];
+        rows[i].flowRate = flowRate[i];
+        rows[i].massFlow = massFlow[i];
+        rows[i].volumeFlow = volumeFlow[i];
+        rows[i].density = density[i];
+        rows[i].currentOfMotor = currentOfMotor[i];
+        rows[i].percentageOfValve = percentageOfValve[i];
+    }
+    return rows;
+}
+
+std::vector<SensorRow> decodeOpenZL(const std::vector<uint8_t>& compressed, uint32_t rowCount) {
+    if (rowCount == 0 || compressed.empty()) return {};
+
+    ZL_DCtx* dctx = ZL_DCtx_create();
+    if (!dctx) {
+        fprintf(stderr, "OpenZL decode context creation failed\n");
+        return {};
+    }
+
+    std::vector<ZL_TypedBuffer*> outs(kFieldCount, nullptr);
+    for (auto*& out : outs) {
+        out = ZL_TypedBuffer_create();
+        if (!out) {
+            fprintf(stderr, "OpenZL typed buffer creation failed\n");
+            for (auto* item : outs) {
+                if (item) ZL_TypedBuffer_free(item);
             }
-            ZL_CCtx_free(cctx);
-            ZL_Compressor_free(compressor);
+            ZL_DCtx_free(dctx);
             return {};
         }
     }
 
-    // Generous upper bound for the output buffer; OpenZL reports the
-    // actual compressed size in the returned report.
-    const size_t dstCapacity = expectedSize + expectedSize / 2 + 4096;
-    std::vector<uint8_t> out(dstCapacity);
-    std::vector<const ZL_TypedRef*> typedInputs;
-    typedInputs.reserve(inputs.size());
-    for (const auto* ref : inputs) {
-        typedInputs.push_back(ref);
-    }
+    const ZL_Report report = ZL_DCtx_decompressMultiTBuffer(
+        dctx,
+        outs.data(),
+        outs.size(),
+        compressed.data(),
+        compressed.size());
 
-    report = ZL_CCtx_compressMultiTypedRef(
-        cctx,
-        out.data(), out.size(),
-        typedInputs.data(), typedInputs.size());
-
-    std::vector<uint8_t> result;
     if (ZL_isError(report)) {
-        fprintf(stderr, "OpenZL compress failed: %s\n",
-                ZL_CCtx_getErrorContextString(cctx, report));
-    } else {
-        const size_t writtenSize = ZL_validResult(report);
-        result.assign(out.begin(), out.begin() + writtenSize);
+        fprintf(stderr, "OpenZL decode failed: %s\n",
+                ZL_DCtx_getErrorContextString(dctx, report));
+        for (auto* item : outs) {
+            if (item) ZL_TypedBuffer_free(item);
+        }
+        ZL_DCtx_free(dctx);
+        return {};
     }
 
-    for (auto* ref : inputs) {
-        if (ref) ZL_TypedRef_free(ref);
-    }
-    ZL_CCtx_free(cctx);
-    ZL_Compressor_free(compressor);
+    auto col = [&](int idx) {
+        return static_cast<const uint8_t*>(ZL_TypedBuffer_rPtr(outs[idx]));
+    };
 
-    return result;
+    const size_t colBytes = static_cast<size_t>(rowCount) * kColWidth;
+    std::vector<int64_t> flat(static_cast<size_t>(kFieldCount) * rowCount);
+    size_t offset = 0;
+    for (int c = 0; c < kFieldCount; ++c) {
+        const auto* src = reinterpret_cast<const int64_t*>(col(c));
+        std::memcpy(flat.data() + offset, src, colBytes);
+        int64_t* dest = flat.data() + offset;
+        deltaDecodeInPlace(dest, static_cast<int>(rowCount));
+        offset += rowCount;
+    }
+
+    std::vector<SensorRow> rows(rowCount);
+    const int64_t* timestamps = flat.data();
+    const int64_t* temp = timestamps + rowCount;
+    const int64_t* pressure = temp + rowCount;
+    const int64_t* flowRate = pressure + rowCount;
+    const int64_t* massFlow = flowRate + rowCount;
+    const int64_t* volumeFlow = massFlow + rowCount;
+    const int64_t* density = volumeFlow + rowCount;
+    const int64_t* currentOfMotor = density + rowCount;
+    const int64_t* percentageOfValve = currentOfMotor + rowCount;
+
+    for (uint32_t i = 0; i < rowCount; ++i) {
+        rows[i].timestamp = timestamps[i];
+        rows[i].temp = temp[i];
+        rows[i].pressure = pressure[i];
+        rows[i].flowRate = flowRate[i];
+        rows[i].massFlow = massFlow[i];
+        rows[i].volumeFlow = volumeFlow[i];
+        rows[i].density = density[i];
+        rows[i].currentOfMotor = currentOfMotor[i];
+        rows[i].percentageOfValve = percentageOfValve[i];
+    }
+
+    for (auto* item : outs) {
+        if (item) ZL_TypedBuffer_free(item);
+    }
+    ZL_DCtx_free(dctx);
+    return rows;
 }
 
-// ---------------------------------------------------------------------------
-// SQLite: one connection per stream thread, WAL mode so green/pink inserts
-// don't block each other's readers, short busy-timeout as a safety net
-// against the brief writer-vs-writer lock.
-// ---------------------------------------------------------------------------
+std::vector<SensorRow> decodePayload(const PacketHeader& hdr, const uint8_t* payloadPtr, size_t payloadLen) {
+    if (hdr.flag == CompressionFlag::OPENZL) {
+        const std::vector<uint8_t> compressed(payloadPtr, payloadPtr + payloadLen);
+        return decodeOpenZL(compressed, hdr.rowCount);
+    }
+
+    if (hdr.flag == CompressionFlag::RAW) {
+        return parseRawColumnar(payloadPtr, payloadLen, hdr.rowCount);
+    }
+
+    if (hdr.flag == CompressionFlag::GZIP) {
+        const std::vector<uint8_t> raw = gzipDecompress(payloadPtr, payloadLen);
+        if (raw.empty()) {
+            fprintf(stderr, "gzip decompress failed for stream %u\n", hdr.streamId);
+            return {};
+        }
+        return parseRawColumnar(raw.data(), raw.size(), hdr.rowCount);
+    }
+
+    fprintf(stderr, "unknown effective compression flag %u for stream %u\n",
+            static_cast<unsigned>(hdr.flag), hdr.streamId);
+    return {};
+}
+
 sqlite3* openDb(const std::string& path) {
     sqlite3* db = nullptr;
     if (sqlite3_open(path.c_str(), &db) != SQLITE_OK) {
@@ -191,106 +202,160 @@ sqlite3* openDb(const std::string& path) {
     }
 
     sqlite3_busy_timeout(db, 5000);
+    sqlite3_exec(db, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", nullptr, nullptr, nullptr);
 
-    const char* pragmas[] = {
-        "PRAGMA journal_mode=WAL;",
-        "PRAGMA synchronous=NORMAL;",
-    };
-    for (const char* p : pragmas) {
-        char* err = nullptr;
-        if (sqlite3_exec(db, p, nullptr, nullptr, &err) != SQLITE_OK) {
-            fprintf(stderr, "SQLite pragma failed (%s): %s\n", p, err);
-            sqlite3_free(err);
-        }
-    }
-
-    const char* createTable =
-        "CREATE TABLE IF NOT EXISTS batches ("
+    static const char* newSchema =
+        "CREATE TABLE IF NOT EXISTS sensor_rows ("
         "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
         "  stream_id INTEGER NOT NULL,"
         "  address TEXT NOT NULL,"
-        "  begin_index INTEGER NOT NULL,"
-        "  end_index INTEGER NOT NULL,"
-        "  initial_time INTEGER NOT NULL,"
-        "  end_time INTEGER NOT NULL,"
         "  row_count INTEGER NOT NULL DEFAULT 0,"
-        "  received_time INTEGER NOT NULL DEFAULT 0,"
         "  received_begin_time INTEGER NOT NULL DEFAULT 0,"
-        "  received_end_time INTEGER NOT NULL DEFAULT 0"
-        ");"
-        "CREATE INDEX IF NOT EXISTS idx_batches_address_time "
-        "  ON batches(stream_id, initial_time);";
+        "  received_end_time INTEGER NOT NULL DEFAULT 0,"
+        "  timestamp INTEGER NOT NULL,"
+        "  temp INTEGER NOT NULL,"
+        "  pressure INTEGER NOT NULL,"
+        "  flowRate INTEGER NOT NULL,"
+        "  massFlow INTEGER NOT NULL,"
+        "  volumeFlow INTEGER NOT NULL,"
+        "  density INTEGER NOT NULL,"
+        "  currentOfMotor INTEGER NOT NULL,"
+        "  percentageOfValve INTEGER NOT NULL"
+        ");";
 
     char* err = nullptr;
-    if (sqlite3_exec(db, createTable, nullptr, nullptr, &err) != SQLITE_OK) {
-        fprintf(stderr, "Failed to create table: %s\n", err);
+    if (sqlite3_exec(db, newSchema, nullptr, nullptr, &err) != SQLITE_OK) {
+        fprintf(stderr, "Failed to create SQLite schema: %s\n", err ? err : "unknown error");
         sqlite3_free(err);
         sqlite3_close(db);
         return nullptr;
     }
-    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_time INTEGER NOT NULL DEFAULT 0;",
-                 nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_begin_time INTEGER NOT NULL DEFAULT 0;",
-                 nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN received_end_time INTEGER NOT NULL DEFAULT 0;",
-                 nullptr, nullptr, nullptr);
-    sqlite3_exec(db, "ALTER TABLE batches ADD COLUMN row_count INTEGER NOT NULL DEFAULT 0;",
-                 nullptr, nullptr, nullptr);
 
+    sqlite3_stmt* tableInfo = nullptr;
+    if (sqlite3_prepare_v2(db, "PRAGMA table_info(sensor_rows);", -1, &tableInfo, nullptr) == SQLITE_OK) {
+        bool needsMigration = false;
+        while (sqlite3_step(tableInfo) == SQLITE_ROW) {
+            const char* columnName = reinterpret_cast<const char*>(sqlite3_column_text(tableInfo, 1));
+            if (columnName && (std::strcmp(columnName, "initial_time") == 0 ||
+                              std::strcmp(columnName, "end_time") == 0 ||
+                              std::strcmp(columnName, "row_index") == 0)) {
+                needsMigration = true;
+                break;
+            }
+        }
+        sqlite3_finalize(tableInfo);
+
+        if (needsMigration) {
+            static const char* migrateSql =
+                "CREATE TABLE sensor_rows_new ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  stream_id INTEGER NOT NULL,"
+                "  address TEXT NOT NULL,"
+                "  row_count INTEGER NOT NULL DEFAULT 0,"
+                "  received_begin_time INTEGER NOT NULL DEFAULT 0,"
+                "  received_end_time INTEGER NOT NULL DEFAULT 0,"
+                "  timestamp INTEGER NOT NULL,"
+                "  temp INTEGER NOT NULL,"
+                "  pressure INTEGER NOT NULL,"
+                "  flowRate INTEGER NOT NULL,"
+                "  massFlow INTEGER NOT NULL,"
+                "  volumeFlow INTEGER NOT NULL,"
+                "  density INTEGER NOT NULL,"
+                "  currentOfMotor INTEGER NOT NULL,"
+                "  percentageOfValve INTEGER NOT NULL"
+                ");"
+                "INSERT INTO sensor_rows_new(stream_id,address,row_count,received_begin_time,received_end_time,timestamp,temp,pressure,flowRate,massFlow,volumeFlow,density,currentOfMotor,percentageOfValve) "
+                "SELECT stream_id,address,row_count,received_begin_time,received_end_time,timestamp,temp,pressure,flowRate,massFlow,volumeFlow,density,currentOfMotor,percentageOfValve FROM sensor_rows;"
+                "DROP TABLE sensor_rows;"
+                "ALTER TABLE sensor_rows_new RENAME TO sensor_rows;"
+                "CREATE INDEX IF NOT EXISTS idx_sensor_rows_stream_time ON sensor_rows(stream_id, timestamp);"
+                "CREATE INDEX IF NOT EXISTS idx_sensor_rows_timestamp ON sensor_rows(timestamp);";
+
+            if (sqlite3_exec(db, migrateSql, nullptr, nullptr, &err) != SQLITE_OK) {
+                fprintf(stderr, "Failed to migrate legacy sensor_rows schema: %s\n", err ? err : "unknown error");
+                sqlite3_free(err);
+                sqlite3_close(db);
+                return nullptr;
+            }
+        } else {
+            static const char* indexSql =
+                "CREATE INDEX IF NOT EXISTS idx_sensor_rows_stream_time ON sensor_rows(stream_id, timestamp);"
+                "CREATE INDEX IF NOT EXISTS idx_sensor_rows_timestamp ON sensor_rows(timestamp);";
+            if (sqlite3_exec(db, indexSql, nullptr, nullptr, &err) != SQLITE_OK) {
+                fprintf(stderr, "Failed to create SQLite indexes: %s\n", err ? err : "unknown error");
+                sqlite3_free(err);
+                sqlite3_close(db);
+                return nullptr;
+            }
+        }
+    }
     return db;
 }
 
-bool insertBatchRow(sqlite3* db, uint8_t streamId, const std::string& address,
-                     int64_t beginIndex, int64_t endIndex,
-                     int64_t initialTime, int64_t endTime,
-                     int64_t receivedBeginTime, int64_t receivedEndTime,
-                     uint32_t rowCount) {
+bool insertRows(sqlite3* db, uint8_t streamId, const std::string& address,
+                int64_t receivedBeginTime, int64_t receivedEndTime,
+                const std::vector<SensorRow>& rows) {
+    if (rows.empty()) return true;
+
     static const char* sql =
-        "INSERT INTO batches (stream_id, address, begin_index, end_index, initial_time, end_time, "
-        "received_time, received_begin_time, received_end_time, row_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        "INSERT INTO sensor_rows(stream_id,address,row_count,received_begin_time,"
+        "received_end_time,timestamp,temp,pressure,flowRate,massFlow,volumeFlow,"
+        "density,currentOfMotor,percentageOfValve) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?);";
+
+    if (sqlite3_exec(db, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        fprintf(stderr, "SQLite BEGIN failed: %s\n", sqlite3_errmsg(db));
+        return false;
+    }
 
     sqlite3_stmt* stmt = nullptr;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr) != SQLITE_OK) {
         fprintf(stderr, "SQLite prepare failed: %s\n", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
         return false;
     }
 
-    sqlite3_bind_int(stmt, 1, streamId);
-    sqlite3_bind_text(stmt, 2, address.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt, 3, beginIndex);
-    sqlite3_bind_int64(stmt, 4, endIndex);
-    sqlite3_bind_int64(stmt, 5, initialTime);
-    sqlite3_bind_int64(stmt, 6, endTime);
-    sqlite3_bind_int64(stmt, 7, receivedEndTime);
-    sqlite3_bind_int64(stmt, 8, receivedBeginTime);
-    sqlite3_bind_int64(stmt, 9, receivedEndTime);
-    sqlite3_bind_int(stmt, 10, static_cast<int>(rowCount));
+    for (size_t i = 0; i < rows.size(); ++i) {
+        sqlite3_reset(stmt);
+        sqlite3_clear_bindings(stmt);
 
-    const bool ok = sqlite3_step(stmt) == SQLITE_DONE;
-    if (!ok) {
-        fprintf(stderr, "SQLite insert failed: %s\n", sqlite3_errmsg(db));
+        sqlite3_bind_int(stmt, 1, streamId);
+        sqlite3_bind_text(stmt, 2, address.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 3, static_cast<int>(rows.size()));
+        sqlite3_bind_int64(stmt, 4, receivedBeginTime);
+        sqlite3_bind_int64(stmt, 5, receivedEndTime);
+        sqlite3_bind_int64(stmt, 6, rows[i].timestamp);
+        sqlite3_bind_int64(stmt, 7, rows[i].temp);
+        sqlite3_bind_int64(stmt, 8, rows[i].pressure);
+        sqlite3_bind_int64(stmt, 9, rows[i].flowRate);
+        sqlite3_bind_int64(stmt, 10, rows[i].massFlow);
+        sqlite3_bind_int64(stmt, 11, rows[i].volumeFlow);
+        sqlite3_bind_int64(stmt, 12, rows[i].density);
+        sqlite3_bind_int64(stmt, 13, rows[i].currentOfMotor);
+        sqlite3_bind_int64(stmt, 14, rows[i].percentageOfValve);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            fprintf(stderr, "SQLite row insert failed: %s\n", sqlite3_errmsg(db));
+            sqlite3_finalize(stmt);
+            sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+            return false;
+        }
     }
 
     sqlite3_finalize(stmt);
-    return ok;
+    if (sqlite3_exec(db, "COMMIT;", nullptr, nullptr, nullptr) != SQLITE_OK) {
+        fprintf(stderr, "SQLite COMMIT failed: %s\n", sqlite3_errmsg(db));
+        sqlite3_exec(db, "ROLLBACK;", nullptr, nullptr, nullptr);
+        return false;
+    }
+    return true;
 }
 
-// ---------------------------------------------------------------------------
-// Per-stream worker: owns its Kafka consumer, its .bin file, and its
-// SQLite connection. Fully independent of the other stream's worker.
-// ---------------------------------------------------------------------------
 class StreamWriter {
 public:
-    StreamWriter(const std::string& brokers, const std::string& dataDir) {
-        binPath_ = dataDir + "\\phonepipe.bin";
-        dbPath_  = dataDir + "\\phonepipe.sqlite3";
-
+    explicit StreamWriter(const std::string& brokers, const std::string& dataDir) {
+        dbPath_ = dataDir + "\\phonepipe.sqlite3";
         db_ = openDb(dbPath_);
-
-        binFile_ = fopen(binPath_.c_str(), "ab+");
-        if (!binFile_) {
-            fprintf(stderr, "Failed to open %s\n", binPath_.c_str());
-        }
 
         std::string errstr;
         std::unique_ptr<RdKafka::Conf> conf(
@@ -318,19 +383,14 @@ public:
         if (consumer_) {
             consumer_->close();
         }
-        if (binFile_) fclose(binFile_);
         if (db_) sqlite3_close(db_);
     }
 
-    bool ok() const { return consumer_ && binFile_ && db_; }
+    bool ok() const { return consumer_ && db_; }
 
-    // Runs forever, consuming this stream's topic. Meant to be launched
-    // on its own std::thread; blocks only on ITS OWN socket/disk/db, never
-    // on the other stream's.
     void run() {
         while (true) {
-            std::unique_ptr<RdKafka::Message> msg(consumer_->consume(1000 /*ms*/));
-
+            std::unique_ptr<RdKafka::Message> msg(consumer_->consume(1000));
             switch (msg->err()) {
                 case RdKafka::ERR__TIMED_OUT:
                     continue;
@@ -362,83 +422,36 @@ private:
                     hdr.payloadLen, len - kHeaderSize);
             return;
         }
-        const size_t payloadLen = hdr.payloadLen;
+
         const int64_t receivedBeginTime = len == wireSize + kReceivedTimeSize
             ? getReceivedBeginTimeMs(raw, wireSize)
             : (len == wireSize + kLegacyReceivedTimeSize
-                ? getReceivedBeginTimeMs(raw, wireSize) : 0);
+                ? getReceivedBeginTimeMs(raw, wireSize)
+                : 0);
         const int64_t receivedEndTime = len == wireSize + kReceivedTimeSize
-            ? getReceivedEndTimeMs(raw, wireSize) : receivedBeginTime;
+            ? getReceivedEndTimeMs(raw, wireSize)
+            : receivedBeginTime;
 
-
-        std::vector<uint8_t> compressedBytes;
-
-        if (hdr.flag == CompressionFlag::OPENZL) {
-            // Already normalized on the receiver; keep the payload as-is.
-            compressedBytes.assign(payloadPtr, payloadPtr + payloadLen);
-        } else if (hdr.flag == CompressionFlag::RAW) {
-            // Raw delta-encoded columnar payload: compress to OpenZL before writing.
-            compressedBytes = openzlCompressDeltaEncoded(payloadPtr, payloadLen, static_cast<int>(hdr.rowCount));
-            if (compressedBytes.empty()) {
-                fprintf(stderr, "openzl compress of raw payload failed, dropping batch\n");
-                return;
-            }
-        } else if (hdr.flag == CompressionFlag::GZIP) {
-            // GZIP packets carry the plain (non-delta-encoded) columnar buffer.
-            std::vector<uint8_t> raw = gzipDecompress(payloadPtr, payloadLen);
-            if (raw.empty()) {
-                fprintf(stderr, "gzip decompress failed for stream %u, dropping batch\n", hdr.streamId);
-                return;
-            }
-            compressedBytes = openzlCompressFresh(raw.data(), raw.size(), static_cast<int>(hdr.rowCount));
-            if (compressedBytes.empty()) {
-                fprintf(stderr, "openzl compress of gzip payload failed, dropping batch\n");
-                return;
-            }
-        } else {
-            fprintf(stderr, "unknown effective compression flag %u for stream %u, dropping batch\n",
-                    static_cast<unsigned>(hdr.flag), hdr.streamId);
+        const std::vector<SensorRow> rows = decodePayload(hdr, payloadPtr, hdr.payloadLen);
+        if (rows.empty()) {
+            fprintf(stderr, "failed to decode payload for stream %u\n", hdr.streamId);
             return;
         }
 
-        // Append to this stream's binary file and record the byte range.
-        if (fseek(binFile_, 0, SEEK_END) != 0) {
-            fprintf(stderr, "seek failed on %s\n", binPath_.c_str());
+        if (!insertRows(db_, hdr.streamId, streamName(hdr.streamId),
+                        receivedBeginTime, receivedEndTime, rows)) {
+            fprintf(stderr, "DB insert failed for stream %u (%s)\n",
+                    hdr.streamId, streamName(hdr.streamId));
             return;
         }
 
-        const long beginIndex = ftell(binFile_);
-        if (beginIndex < 0) {
-            fprintf(stderr, "ftell failed on %s\n", binPath_.c_str());
-            return;
-        }
-
-        const size_t written = fwrite(compressedBytes.data(), 1, compressedBytes.size(), binFile_);
-        if (written != compressedBytes.size()) {
-            fprintf(stderr, "short write to %s\n", binPath_.c_str());
-            return;
-        }
-        fflush(binFile_);
-
-        const long endIndex = beginIndex + static_cast<long>(written);
-
-        if (!insertBatchRow(db_, hdr.streamId, streamName(hdr.streamId), beginIndex,
-                            endIndex, hdr.initialTimeMs, hdr.endTimeMs,
-                            receivedBeginTime, receivedEndTime, hdr.rowCount)) {
-            fprintf(stderr, "DB insert failed for batch [%ld, %ld)\n", beginIndex, endIndex);
-            return;
-        }
-
-         printf("[%s:%u] stored %zu compressed bytes at [%ld, %ld), t=[%lld..%lld]\n",
-             streamName(hdr.streamId), hdr.streamId, compressedBytes.size(), beginIndex, endIndex,
-               static_cast<long long>(hdr.initialTimeMs),
-               static_cast<long long>(hdr.endTimeMs));
+        printf("[%s:%u] decoded %zu rows, first_ts=%lld, last_ts=%lld\n",
+               streamName(hdr.streamId), hdr.streamId, rows.size(),
+               static_cast<long long>(rows.front().timestamp),
+               static_cast<long long>(rows.back().timestamp));
     }
 
-    std::string binPath_;
     std::string dbPath_;
-
-    FILE* binFile_ = nullptr;
     sqlite3* db_ = nullptr;
     std::unique_ptr<RdKafka::KafkaConsumer> consumer_;
 };
@@ -452,7 +465,7 @@ int main() {
     }
 
     std::string dataDir = "data";
-    CreateDirectoryA(dataDir.c_str(), nullptr); // ok if it already exists
+    CreateDirectoryA(dataDir.c_str(), nullptr);
 
     StreamWriter writer(brokers, dataDir);
     if (!writer.ok()) {
@@ -460,6 +473,5 @@ int main() {
         return 1;
     }
     writer.run();
-
     return 0;
 }

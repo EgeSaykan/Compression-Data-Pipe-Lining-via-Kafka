@@ -243,22 +243,30 @@ bool TabletServer::handleRequest(SOCKET client, const std::vector<uint8_t>& payl
 
 bool TabletServer::handleBatch(SOCKET client, const std::vector<uint8_t>& body) {
     const auto batchStart = SteadyClock::now();
+    printf("hh1\n");
     if (body.size() != kBatchBodySize || body[0] != kProtocolVersion ||
         (body[1] != static_cast<uint8_t>(RequestRangeKey::Id) &&
          body[1] != static_cast<uint8_t>(RequestRangeKey::Timestamp))) {
         return sendError(client, "malformed batch request");
     }
+    printf("hh2\n");
     RecordRange range;
     range.key = body[1] == 0 ? RangeKey::Id : RangeKey::Timestamp;
     range.streamId = body[2];
     range.start = getI64LE(body.data() + 4);
     range.end = getI64LE(body.data() + 12);
+    printf("Batch request: key=%s streamId=%u start=%lld end=%lld\n",
+           range.key == RangeKey::Id ? "id" : "timestamp",
+           static_cast<unsigned>(range.streamId),
+           static_cast<long long>(range.start),
+           static_cast<long long>(range.end));
     ReadDb reader(databasePath_, binaryPath_);
     const auto readStart = SteadyClock::now();
     ReadResult result = reader.readRange(range);
     std::printf("[BatchTiming] readRange records=%zu bytes=%lldms\n",
                 result.records.size(), static_cast<long long>(elapsedMs(readStart)));
     if (!result.ok()) return sendError(client, result.error);
+    printf("hh3\n");
 
     std::printf("Sending %zu historical records\n", result.records.size());
     size_t totalBytes = 0;
@@ -271,18 +279,17 @@ bool TabletServer::handleBatch(SOCKET client, const std::vector<uint8_t>& body) 
         if (rowCount == 0) {
             return sendError(client, "historical record has no valid row count");
         }
-        std::vector<uint8_t> recordBody(52 + record.compressedBytes.size());
+        std::vector<uint8_t> recordBody(44 + record.compressedBytes.size());
         recordBody[0] = kProtocolVersion;
         recordBody[1] = record.streamId;
         putU16LE(recordBody.data() + 2, 0); // reserved
         putI64LE(recordBody.data() + 4, record.id);
-        putI64LE(recordBody.data() + 12, record.initialTime);
-        putI64LE(recordBody.data() + 20, record.endTime);
-        putI64LE(recordBody.data() + 28, record.receivedBeginTime);
-        putI64LE(recordBody.data() + 36, record.receivedEndTime);
-        putU32LE(recordBody.data() + 44, rowCount);
-        putU32LE(recordBody.data() + 48, static_cast<uint32_t>(record.compressedBytes.size()));
-        std::copy(record.compressedBytes.begin(), record.compressedBytes.end(), recordBody.begin() + 52);
+        putI64LE(recordBody.data() + 12, record.timestamp);
+        putI64LE(recordBody.data() + 20, record.receivedBeginTime);
+        putI64LE(recordBody.data() + 28, record.receivedEndTime);
+        putU32LE(recordBody.data() + 36, rowCount);
+        putU32LE(recordBody.data() + 40, static_cast<uint32_t>(record.compressedBytes.size()));
+        std::copy(record.compressedBytes.begin(), record.compressedBytes.end(), recordBody.begin() + 44);
 
         const auto frame = makeFrame(FrameType::DataRecord, recordBody);
         const auto sendStart = SteadyClock::now();
@@ -315,18 +322,17 @@ bool TabletServer::handleLive(SOCKET client, const std::vector<uint8_t>& request
             if (rowCount == 0) {
                 return sendError(client, "backfill record has no valid row count");
             }
-            std::vector<uint8_t> recordBody(52 + record.compressedBytes.size());
+            std::vector<uint8_t> recordBody(44 + record.compressedBytes.size());
             recordBody[0] = kProtocolVersion;
             recordBody[1] = record.streamId;
             putU16LE(recordBody.data() + 2, 0); // reserved
             putI64LE(recordBody.data() + 4, record.id);
-            putI64LE(recordBody.data() + 12, record.initialTime);
-            putI64LE(recordBody.data() + 20, record.endTime);
-            putI64LE(recordBody.data() + 28, record.receivedBeginTime);
-            putI64LE(recordBody.data() + 36, record.receivedEndTime);
-            putU32LE(recordBody.data() + 44, rowCount);
-            putU32LE(recordBody.data() + 48, static_cast<uint32_t>(record.compressedBytes.size()));
-            std::copy(record.compressedBytes.begin(), record.compressedBytes.end(), recordBody.begin() + 52);
+            putI64LE(recordBody.data() + 12, record.timestamp);
+            putI64LE(recordBody.data() + 20, record.receivedBeginTime);
+            putI64LE(recordBody.data() + 28, record.receivedEndTime);
+            putU32LE(recordBody.data() + 36, rowCount);
+            putU32LE(recordBody.data() + 40, static_cast<uint32_t>(record.compressedBytes.size()));
+            std::copy(record.compressedBytes.begin(), record.compressedBytes.end(), recordBody.begin() + 44);
 
             const auto frame = makeFrame(FrameType::DataRecord, recordBody);
             if (frame.empty() || !sendAll(client, frame.data(), frame.size())) return false;
