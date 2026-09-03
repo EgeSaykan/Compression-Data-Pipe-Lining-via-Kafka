@@ -17,14 +17,18 @@
 #include <cstdint>
 #include <vector>
 
+#include "wire_protocol.h"
+
 namespace phonepipe {
 
 // `data` must already be delta-encoded columnar (kFieldCount columns of
 // rowCount int64/double-bitpattern elements each). Entropy-compresses only.
-std::vector<uint8_t> openzlCompressDeltaEncoded(const uint8_t* data, size_t len, int rowCount);
+std::vector<uint8_t> openzlCompressDeltaEncoded(const uint8_t* data, size_t len, int rowCount,
+												int fieldCount = kFieldCount);
 
 // `data` is plain (non-delta-encoded) columnar data. Delta-encodes each
 // column, then entropy-compresses -- matches the device's OPENZL mode exactly.
-std::vector<uint8_t> openzlCompressFresh(const uint8_t* data, size_t len, int rowCount);
+std::vector<uint8_t> openzlCompressFresh(const uint8_t* data, size_t len, int rowCount,
+										 int fieldCount = kFieldCount);
 
 } // namespace phonepipe

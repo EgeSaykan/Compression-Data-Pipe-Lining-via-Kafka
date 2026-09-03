@@ -24,11 +24,15 @@ struct Record {
     int64_t id = 0;
     uint8_t streamId = 0;
     std::string address;
-    int64_t rowCount = 0;
     int64_t timestamp = 0;
-    int64_t receivedBeginTime = 0;
-    int64_t receivedEndTime = 0;
-    std::vector<uint8_t> compressedBytes;
+    int64_t temp = 0;
+    int64_t pressure = 0;
+    int64_t flowRate = 0;
+    int64_t massFlow = 0;
+    int64_t volumeFlow = 0;
+    int64_t density = 0;
+    int64_t currentOfMotor = 0;
+    int64_t percentageOfValve = 0;
 };
 
 struct ReadResult {

@@ -1,8 +1,6 @@
 #include "read_db.h"
 
 #include <cstdio>
-#include <fstream>
-#include <limits>
 #include <utility>
 #include <sqlite3.h>
 
@@ -37,38 +35,6 @@ ReadResult failure(const std::string& message) {
     return result;
 }
 
-bool readBlob(const std::string& path, int64_t begin, int64_t end,
-              std::vector<uint8_t>& output, std::string& error) {
-    if (begin < 0 || end < begin) {
-        error = "invalid binary range";
-        return false;
-    }
-    const uint64_t length = static_cast<uint64_t>(end - begin);
-    if (length > std::numeric_limits<size_t>::max()) {
-        error = "binary range is too large";
-        return false;
-    }
-
-    std::ifstream file(path, std::ios::binary);
-    if (!file) {
-        error = "could not open binary data file: " + path;
-        return false;
-    }
-    file.seekg(begin, std::ios::beg);
-    if (!file) {
-        error = "could not seek in binary data file";
-        return false;
-    }
-    output.resize(static_cast<size_t>(length));
-    if (length != 0 && !file.read(reinterpret_cast<char*>(output.data()),
-                                  static_cast<std::streamsize>(length))) {
-        error = "binary data range is truncated";
-        output.clear();
-        return false;
-    }
-    return true;
-}
-
 } // namespace
 
 ReadDb::ReadDb(std::string databasePath, std::string binaryPath)
@@ -82,9 +48,11 @@ ReadResult ReadDb::readRange(const RecordRange& range) const {
 
     const char* column = range.key == RangeKey::Id ? "id" : "timestamp";
     const std::string sql =
-        "SELECT id, stream_id, address, row_count, received_begin_time, received_end_time, timestamp "
+        "SELECT id, stream_id, address, timestamp, temp, pressure, flowRate, massFlow, "
+        "volumeFlow, density, currentOfMotor, percentageOfValve "
         "FROM sensor_rows WHERE " + std::string(column) + " >= ? AND " + std::string(column) + " <= ?" +
         (range.streamId != 0xff ? " AND stream_id = ?" : "") + " ORDER BY id ASC;";
+    
     std::vector<int64_t> values{range.start, range.end};
     if (range.streamId != 0xff) values.push_back(range.streamId);
     return readQuery(sql, values);
@@ -93,7 +61,8 @@ ReadResult ReadDb::readRange(const RecordRange& range) const {
 ReadResult ReadDb::readSince(int64_t cursorId, uint8_t streamId) const {
     if (cursorId < 0) return failure("cursor id cannot be negative");
     const std::string sql =
-        "SELECT id, stream_id, address, row_count, received_begin_time, received_end_time, timestamp "
+        "SELECT id, stream_id, address, timestamp, temp, pressure, flowRate, massFlow, "
+        "volumeFlow, density, currentOfMotor, percentageOfValve "
         "FROM sensor_rows WHERE id > ?" +
         std::string(streamId != 0xff ? " AND stream_id = ?" : "") + " ORDER BY id ASC;";
     std::vector<int64_t> values{cursorId};
@@ -121,6 +90,8 @@ bool ReadDb::maxId(int64_t& id, std::string& error) const {
 }
 
 ReadResult ReadDb::readQuery(const std::string& sql, const std::vector<int64_t>& values) const {
+    std::fprintf(stderr, "SQL request:\n%s\n", sql.c_str());
+
     DbHandle db(databasePath_);
     if (!db.get()) return failure(db.error());
 
@@ -146,10 +117,15 @@ ReadResult ReadDb::readQuery(const std::string& sql, const std::vector<int64_t>&
         record.streamId = static_cast<uint8_t>(sqlite3_column_int(statement, 1));
         const unsigned char* address = sqlite3_column_text(statement, 2);
         record.address = address ? reinterpret_cast<const char*>(address) : "";
-        record.rowCount = sqlite3_column_int64(statement, 3);
-        record.receivedBeginTime = sqlite3_column_int64(statement, 4);
-        record.receivedEndTime = sqlite3_column_int64(statement, 5);
-        record.timestamp = sqlite3_column_int64(statement, 6);
+        record.timestamp = sqlite3_column_int64(statement, 3);
+        record.temp = sqlite3_column_int64(statement, 4);
+        record.pressure = sqlite3_column_int64(statement, 5);
+        record.flowRate = sqlite3_column_int64(statement, 6);
+        record.massFlow = sqlite3_column_int64(statement, 7);
+        record.volumeFlow = sqlite3_column_int64(statement, 8);
+        record.density = sqlite3_column_int64(statement, 9);
+        record.currentOfMotor = sqlite3_column_int64(statement, 10);
+        record.percentageOfValve = sqlite3_column_int64(statement, 11);
         result.records.push_back(std::move(record));
     }
     sqlite3_finalize(statement);

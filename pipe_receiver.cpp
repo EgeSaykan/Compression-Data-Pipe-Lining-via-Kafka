@@ -69,8 +69,8 @@ int main(int argc, char* argv[]) {
 					if (packet.size() >= wireSize) {
 						std::vector<uint8_t> compressedOnly(packet.begin() + phonepipe::kHeaderSize,
 																		 packet.begin() + wireSize);
-						tabletServer.offerLivePacket(pipeId, compressedOnly, receivedBeginTimeMs,
-																	 receivedEndTimeMs, header.rowCount);
+						tabletServer.offerLivePacket(pipeId, compressedOnly,
+							header.rowCount);
 					}
 				}
 				phonepipe::appendReceivedTimes(copy, receivedBeginTimeMs, receivedEndTimeMs);
@@ -102,8 +102,7 @@ int main(int argc, char* argv[]) {
 					if (packet.size() >= wireSize) {
 						std::vector<uint8_t> compressedOnly(packet.begin() + phonepipe::kHeaderSize,
 																		 packet.begin() + wireSize);
-						tabletServer.offerLivePacket(pipeId, compressedOnly, receivedBeginTimeMs,
-																	 receivedEndTimeMs, header.rowCount);
+						tabletServer.offerLivePacket(pipeId, compressedOnly, header.rowCount);
 					}
 				}
 				phonepipe::appendReceivedTimes(copy, receivedBeginTimeMs, receivedEndTimeMs);

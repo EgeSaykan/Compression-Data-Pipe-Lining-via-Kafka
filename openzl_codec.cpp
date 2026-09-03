@@ -63,7 +63,8 @@ void deltaEncodeInPlace(int64_t* col, int rowCount) {
 
 // Shared entropy-compression stage. `aligned` must already hold
 // (possibly delta-encoded) columnar data.
-std::vector<uint8_t> entropyCompress(AlignedColumns& aligned, size_t expectedLen, int rowCount) {
+std::vector<uint8_t> entropyCompress(AlignedColumns& aligned, size_t expectedLen,
+                                     int rowCount, int fieldCount) {
     std::vector<uint8_t> out;
 
     ZL_Compressor* compressor = getCompressor();
@@ -73,8 +74,8 @@ std::vector<uint8_t> entropyCompress(AlignedColumns& aligned, size_t expectedLen
     }
 
     const size_t colBytes = static_cast<size_t>(rowCount) * kColWidth;
-    std::vector<const ZL_TypedRef*> refs(kFieldCount, nullptr);
-    for (int c = 0; c < kFieldCount; c++) {
+    std::vector<const ZL_TypedRef*> refs(fieldCount, nullptr);
+    for (int c = 0; c < fieldCount; c++) {
         uint8_t* colStart = aligned.bytes() + c * colBytes;
         refs[c] = ZL_TypedRef_createNumeric(colStart, kColWidth, static_cast<size_t>(rowCount));
         if (!refs[c]) {
@@ -121,36 +122,58 @@ std::vector<uint8_t> entropyCompress(AlignedColumns& aligned, size_t expectedLen
 
 } // namespace
 
-std::vector<uint8_t> openzlCompressDeltaEncoded(const uint8_t* data, size_t len, int rowCount) {
+std::vector<uint8_t> openzlCompressDeltaEncoded(const uint8_t* data, size_t len, int rowCount, int numCols) {
     std::vector<uint8_t> out;
-    const size_t expectedLen = static_cast<size_t>(rowCount) * kColWidth * kFieldCount;
-    if (rowCount <= 0 || len != expectedLen) {
+    if (rowCount <= 0) return out;
+
+    if (numCols < 0) {
+        if ((len % (static_cast<size_t>(rowCount) * kColWidth)) != 0) {
+            fprintf(stderr, "openzlCompressDeltaEncoded: bad input size %zu for rowCount %d\n", len, rowCount);
+            return out;
+        }
+        numCols = static_cast<int>(len / (static_cast<size_t>(rowCount) * kColWidth));
+    }
+
+    const size_t expectedLen = static_cast<size_t>(rowCount) * kColWidth * numCols;
+    if (len != expectedLen) {
         fprintf(stderr, "openzlCompressDeltaEncoded: bad input size %zu, expected %zu\n", len, expectedLen);
         return out;
     }
-    AlignedColumns aligned(expectedLen / sizeof(int64_t));
+
+    AlignedColumns aligned(len / sizeof(int64_t));
     std::memcpy(aligned.bytes(), data, len);
     // Already delta-encoded on-device -- straight to entropy coding.
-    return entropyCompress(aligned, expectedLen, rowCount);
+    return entropyCompress(aligned, len, rowCount, numCols);
 }
 
-std::vector<uint8_t> openzlCompressFresh(const uint8_t* data, size_t len, int rowCount) {
+std::vector<uint8_t> openzlCompressFresh(const uint8_t* data, size_t len, int rowCount, int numCols) {
     std::vector<uint8_t> out;
-    const size_t expectedLen = static_cast<size_t>(rowCount) * kColWidth * kFieldCount;
-    if (rowCount <= 0 || len != expectedLen) {
+    if (rowCount <= 0) return out;
+
+    if (numCols < 0) {
+        if ((len % (static_cast<size_t>(rowCount) * kColWidth)) != 0) {
+            fprintf(stderr, "openzlCompressFresh: bad input size %zu for rowCount %d\n", len, rowCount);
+            return out;
+        }
+        numCols = static_cast<int>(len / (static_cast<size_t>(rowCount) * kColWidth));
+    }
+
+    const size_t expectedLen = static_cast<size_t>(rowCount) * kColWidth * numCols;
+    if (len != expectedLen) {
         fprintf(stderr, "openzlCompressFresh: bad input size %zu, expected %zu\n", len, expectedLen);
         return out;
     }
-    AlignedColumns aligned(expectedLen / sizeof(int64_t));
+
+    AlignedColumns aligned(len / sizeof(int64_t));
     std::memcpy(aligned.bytes(), data, len);
 
     const size_t colBytes = static_cast<size_t>(rowCount) * kColWidth;
-    for (int c = 0; c < kFieldCount; c++) {
+    for (int c = 0; c < numCols; c++) {
         auto* colPtr = reinterpret_cast<int64_t*>(aligned.bytes() + c * colBytes);
         deltaEncodeInPlace(colPtr, rowCount);
     }
 
-    return entropyCompress(aligned, expectedLen, rowCount);
+    return entropyCompress(aligned, len, rowCount, numCols);
 }
 
 } // namespace phonepipe

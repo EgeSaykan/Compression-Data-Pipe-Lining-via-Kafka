@@ -9,7 +9,7 @@
 #include <chrono>
 #include <limits>
 
-#include "openzl/zl_decompress.h"
+#include "openzl_codec.h"
 #include "wire_protocol.h"
 
 using  phonepipe::kFieldCount;
@@ -27,6 +27,7 @@ const GUID kTabletSppUuid = {
 constexpr size_t kBatchBodySize = 20;
 constexpr size_t kLiveBodySize = 12;
 constexpr size_t kMaxErrorMessage = 1024;
+constexpr int kTabletFieldCount = kFieldCount + 1;
 
 using SteadyClock = std::chrono::steady_clock;
 
@@ -35,48 +36,39 @@ int64_t elapsedMs(SteadyClock::time_point start) {
         SteadyClock::now() - start).count();
 }
 
-int64_t recoverRowCount(const std::vector<uint8_t>& compressedBytes) {
-    if (compressedBytes.empty()) return 0;
+// Flattens records into the tablet payload: pipe ID followed by the sensor
+// columns, with rowCount int64 elements per column in column-major order.
+std::vector<int64_t> flattenColumnar(const std::vector<Record>& records) {
+    const size_t rowCount = records.size();
+    std::vector<int64_t> flat(static_cast<size_t>(kTabletFieldCount) * rowCount);
+    int64_t* pipeId = flat.data();
+    int64_t* timestamp = pipeId + rowCount;
+    int64_t* temp = timestamp + rowCount;
+    int64_t* pressure = temp + rowCount;
+    int64_t* flowRate = pressure + rowCount;
+    int64_t* massFlow = flowRate + rowCount;
+    int64_t* volumeFlow = massFlow + rowCount;
+    int64_t* density = volumeFlow + rowCount;
+    int64_t* currentOfMotor = density + rowCount;
+    int64_t* percentageOfValve = currentOfMotor + rowCount;
 
-    ZL_DCtx* context = ZL_DCtx_create();
-    if (!context) return 0;
-    std::vector<ZL_TypedBuffer*> outputs(kFieldCount, nullptr);
-    for (auto*& output : outputs) output = ZL_TypedBuffer_create();
-
-    bool ready = std::all_of(outputs.begin(), outputs.end(), [](auto* output) {
-        return output != nullptr;
-    });
-    int64_t rowCount = 0;
-    if (ready) {
-        const ZL_Report report = ZL_DCtx_decompressMultiTBuffer(
-            context, outputs.data(), outputs.size(),
-            compressedBytes.data(), compressedBytes.size());
-        if (!ZL_isError(report) && ZL_TypedBuffer_eltWidth(outputs[0]) == sizeof(int64_t)) {
-            const size_t count = ZL_TypedBuffer_numElts(outputs[0]);
-            const bool matchingCounts = std::all_of(outputs.begin(), outputs.end(),
-                [count](auto* output) {
-                    return ZL_TypedBuffer_eltWidth(output) == sizeof(int64_t) &&
-                           ZL_TypedBuffer_numElts(output) == count;
-                });
-            if (matchingCounts && count <= static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
-                rowCount = static_cast<int64_t>(count);
-            }
-        }
+    for (size_t i = 0; i < rowCount; ++i) {
+        const Record& record = records[i];
+        pipeId[i] = record.streamId;
+        timestamp[i] = record.timestamp;
+        temp[i] = record.temp;
+        pressure[i] = record.pressure;
+        flowRate[i] = record.flowRate;
+        massFlow[i] = record.massFlow;
+        volumeFlow[i] = record.volumeFlow;
+        density[i] = record.density;
+        currentOfMotor[i] = record.currentOfMotor;
+        percentageOfValve[i] = record.percentageOfValve;
     }
-
-    for (auto* output : outputs) {
-        if (output) ZL_TypedBuffer_free(output);
-    }
-    ZL_DCtx_free(context);
-    return rowCount;
+    return flat;
 }
 
-uint32_t rowCountForRecord(const Record& record) {
-    const int64_t rowCount = record.rowCount > 0
-        ? record.rowCount : recoverRowCount(record.compressedBytes);
-    if (rowCount <= 0 || rowCount > std::numeric_limits<uint32_t>::max()) return 0;
-    return static_cast<uint32_t>(rowCount);
-}
+constexpr size_t kLiveBatchFlushLimit = 12;
 
 bool readExact(SOCKET socket, uint8_t* buffer, size_t size) {
     size_t offset = 0;
@@ -123,7 +115,6 @@ bool TabletServer::isLiveClientConnected() const {
 }
 
 void TabletServer::offerLivePacket(uint8_t streamId, const std::vector<uint8_t>& packet,
-                                    int64_t receivedBeginTimeMs, int64_t receivedEndTimeMs,
                                     uint32_t rowCount) {
     if (!liveClientConnected_.load(std::memory_order_relaxed) ||
         !liveModeActive_.load(std::memory_order_relaxed)) return;
@@ -131,7 +122,7 @@ void TabletServer::offerLivePacket(uint8_t streamId, const std::vector<uint8_t>&
     if (!liveClientConnected_.load(std::memory_order_relaxed) ||
         !liveModeActive_.load(std::memory_order_relaxed)) return;
     if (liveQueue_.size() >= kLiveQueueCapacity) liveQueue_.pop_front();
-    liveQueue_.push_back({streamId, receivedBeginTimeMs, receivedEndTimeMs, rowCount, packet});
+    liveQueue_.push_back({streamId, rowCount, packet});
 }
 
 void TabletServer::stop() {
@@ -226,6 +217,38 @@ void TabletServer::serveClient(SOCKET client) {
     }
 }
 
+bool TabletServer::sendAggregatedRecords(SOCKET client, const std::vector<Record>& records) {
+    if (records.empty()) return true;
+    if (records.size() > std::numeric_limits<uint32_t>::max()) return false;
+
+    const uint32_t totalRows = static_cast<uint32_t>(records.size());
+    int64_t firstTimestamp = records.front().timestamp;
+    for (const Record& record : records) {
+        firstTimestamp = std::min(firstTimestamp, record.timestamp);
+    }
+
+    const std::vector<int64_t> flat = flattenColumnar(records);
+    const std::vector<uint8_t> compressed = phonepipe::openzlCompressFresh(
+        reinterpret_cast<const uint8_t*>(flat.data()), flat.size() * sizeof(int64_t),
+        static_cast<int>(totalRows), kTabletFieldCount);
+    if (compressed.empty()) return false;
+
+    std::vector<uint8_t> batchBody(28 + compressed.size());
+    batchBody[0] = kProtocolVersion;
+    batchBody[1] = records.front().streamId;
+    putU16LE(batchBody.data() + 2, 0);
+    putI64LE(batchBody.data() + 4, records.front().id);
+    putI64LE(batchBody.data() + 12, firstTimestamp);
+    putU32LE(batchBody.data() + 20, totalRows);
+    putU32LE(batchBody.data() + 24, static_cast<uint32_t>(compressed.size()));
+    std::copy(compressed.begin(), compressed.end(), batchBody.begin() + 28);
+
+    const auto frame = makeFrame(FrameType::DataRecord, batchBody);
+    std::printf("Historical package: records=%zu rows=%u compressed=%zu bytes body=%zu bytes frame=%zu bytes\n",
+                records.size(), totalRows, compressed.size(), batchBody.size(), frame.size());
+    return !frame.empty() && sendAll(client, frame.data(), frame.size());
+}
+
 bool TabletServer::handleRequest(SOCKET client, const std::vector<uint8_t>& payload) {
     if (payload.empty()) return sendError(client, "empty request");
     const auto type = static_cast<FrameType>(payload[0]);
@@ -263,7 +286,7 @@ bool TabletServer::handleBatch(SOCKET client, const std::vector<uint8_t>& body) 
     ReadDb reader(databasePath_, binaryPath_);
     const auto readStart = SteadyClock::now();
     ReadResult result = reader.readRange(range);
-    std::printf("[BatchTiming] readRange records=%zu bytes=%lldms\n",
+    std::printf("[BatchTiming] readRange records=%zu elapsed=%lldms\n",
                 result.records.size(), static_cast<long long>(elapsedMs(readStart)));
     if (!result.ok()) return sendError(client, result.error);
     printf("hh3\n");
@@ -272,31 +295,11 @@ bool TabletServer::handleBatch(SOCKET client, const std::vector<uint8_t>& body) 
     size_t totalBytes = 0;
     int64_t recoveryMs = 0;
     int64_t sendMs = 0;
-    for (const Record& record : result.records) {
-        const auto recordStart = SteadyClock::now();
-        const uint32_t rowCount = rowCountForRecord(record);
-        recoveryMs += elapsedMs(recordStart);
-        if (rowCount == 0) {
-            return sendError(client, "historical record has no valid row count");
-        }
-        std::vector<uint8_t> recordBody(44 + record.compressedBytes.size());
-        recordBody[0] = kProtocolVersion;
-        recordBody[1] = record.streamId;
-        putU16LE(recordBody.data() + 2, 0); // reserved
-        putI64LE(recordBody.data() + 4, record.id);
-        putI64LE(recordBody.data() + 12, record.timestamp);
-        putI64LE(recordBody.data() + 20, record.receivedBeginTime);
-        putI64LE(recordBody.data() + 28, record.receivedEndTime);
-        putU32LE(recordBody.data() + 36, rowCount);
-        putU32LE(recordBody.data() + 40, static_cast<uint32_t>(record.compressedBytes.size()));
-        std::copy(record.compressedBytes.begin(), record.compressedBytes.end(), recordBody.begin() + 44);
-
-        const auto frame = makeFrame(FrameType::DataRecord, recordBody);
-        const auto sendStart = SteadyClock::now();
-        if (frame.empty() || !sendAll(client, frame.data(), frame.size())) return false;
-        sendMs += elapsedMs(sendStart);
-        totalBytes += frame.size();
+    if (!sendAggregatedRecords(client, result.records)) {
+        printf("Failed to send historical batch payload\n");
+        return sendError(client, "historical batch payload is invalid");
     }
+    printf("not failed to send historical batch payload\n");
     const auto end = makeFrame(FrameType::BatchEnd, {kProtocolVersion});
     const auto endSendStart = SteadyClock::now();
     const bool sent = !end.empty() && sendAll(client, end.data(), end.size());
@@ -317,25 +320,8 @@ bool TabletServer::handleLive(SOCKET client, const std::vector<uint8_t>& request
         ReadResult backfill = reader.readSince(getI64LE(requestBody.data() + 4));
         if (!backfill.ok()) return sendError(client, backfill.error);
         std::printf("Sending %zu backfill records\n", backfill.records.size());
-        for (const Record& record : backfill.records) {
-            const uint32_t rowCount = rowCountForRecord(record);
-            if (rowCount == 0) {
-                return sendError(client, "backfill record has no valid row count");
-            }
-            std::vector<uint8_t> recordBody(44 + record.compressedBytes.size());
-            recordBody[0] = kProtocolVersion;
-            recordBody[1] = record.streamId;
-            putU16LE(recordBody.data() + 2, 0); // reserved
-            putI64LE(recordBody.data() + 4, record.id);
-            putI64LE(recordBody.data() + 12, record.timestamp);
-            putI64LE(recordBody.data() + 20, record.receivedBeginTime);
-            putI64LE(recordBody.data() + 28, record.receivedEndTime);
-            putU32LE(recordBody.data() + 36, rowCount);
-            putU32LE(recordBody.data() + 40, static_cast<uint32_t>(record.compressedBytes.size()));
-            std::copy(record.compressedBytes.begin(), record.compressedBytes.end(), recordBody.begin() + 44);
-
-            const auto frame = makeFrame(FrameType::DataRecord, recordBody);
-            if (frame.empty() || !sendAll(client, frame.data(), frame.size())) return false;
+        if (!sendAggregatedRecords(client, backfill.records)) {
+            return sendError(client, "backfill batch payload is invalid");
         }
     }
 
@@ -359,29 +345,31 @@ bool TabletServer::handleLive(SOCKET client, const std::vector<uint8_t>& request
             return sendError(client, "only stop is valid during live mode");
         }
 
-        QueuedPacket queued;
+        std::vector<QueuedPacket> batch;
         {
             std::lock_guard<std::mutex> lock(queueMutex_);
-            if (liveQueue_.empty()) continue;
-            queued = std::move(liveQueue_.front());
-            liveQueue_.pop_front();
+            while (!liveQueue_.empty() && batch.size() < kLiveBatchFlushLimit) {
+                batch.push_back(std::move(liveQueue_.front()));
+                liveQueue_.pop_front();
+            }
         }
+        if (batch.empty()) continue;
 
-        // Header size 28: v(1), sid(1), res(2), rxb(8), rxe(8), rc(4), plen(4)
-        std::vector<uint8_t> packetBody(28 + queued.packet.size());
-        packetBody[0] = kProtocolVersion;
-        packetBody[1] = queued.streamId;
-        putU16LE(packetBody.data() + 2, 0); // reserved
-        putI64LE(packetBody.data() + 4, queued.receivedBeginTimeMs);
-        putI64LE(packetBody.data() + 12, queued.receivedEndTimeMs);
-        putU32LE(packetBody.data() + 20, queued.rowCount);
-        putU32LE(packetBody.data() + 24, static_cast<uint32_t>(queued.packet.size()));
-        std::copy(queued.packet.begin(), queued.packet.end(), packetBody.begin() + 28);
+        for (QueuedPacket& queued : batch) {
+            // Header size 12: v(1), sid(1), res(2), rc(4), plen(4)
+            std::vector<uint8_t> packetBody(12 + queued.packet.size());
+            packetBody[0] = kProtocolVersion;
+            packetBody[1] = queued.streamId;
+            putU16LE(packetBody.data() + 2, 0); // reserved
+            putU32LE(packetBody.data() + 4, queued.rowCount);
+            putU32LE(packetBody.data() + 8, static_cast<uint32_t>(queued.packet.size()));
+            std::copy(queued.packet.begin(), queued.packet.end(), packetBody.begin() + 12);
 
-        const auto frame = makeFrame(FrameType::LivePacket, packetBody);
-        if (frame.empty() || !sendAll(client, frame.data(), frame.size())) {
-            std::printf("Failed to send live packet\n");
-            return false;
+            const auto frame = makeFrame(FrameType::LivePacket, packetBody);
+            if (frame.empty() || !sendAll(client, frame.data(), frame.size())) {
+                std::printf("Failed to send live packet\n");
+                return false;
+            }
         }
     }
     return false;
