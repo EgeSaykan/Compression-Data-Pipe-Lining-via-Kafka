@@ -40,7 +40,7 @@
 
 namespace phonepipe {
 
-constexpr size_t kHeaderSize = 10;
+constexpr size_t kHeaderSize = 18;
 constexpr size_t kLegacyReceivedTimeSize = 8;
 constexpr size_t kReceivedTimeSize = 16;
 constexpr int    kFieldCount = 9;
@@ -54,6 +54,13 @@ enum class CompressionFlag : uint8_t {
     RAW    = 0x00,
     OPENZL = 0x01,
     GZIP   = 0x02,
+    CONTROL = 0xFF,
+};
+
+enum class ControlOp : uint8_t {
+    PING = 0x01,
+    PONG = 0x02,
+    SYNC_RESULT = 0x03,
 };
 
 inline bool isValidStream(uint8_t streamId) {
@@ -73,6 +80,7 @@ struct PacketHeader {
     uint8_t  streamId = 0;
     uint32_t rowCount = 0;
     uint32_t payloadLen = 0;
+    int64_t  sendTime = 0;
 };
 
 inline void putU32BE(uint8_t* p, uint32_t v) {
@@ -125,6 +133,7 @@ inline PacketHeader decodeHeader(const uint8_t* h) {
     hdr.streamId   = h[1];
     hdr.rowCount   = getU32BE(h + 2);
     hdr.payloadLen = getU32BE(h + 6);
+    hdr.sendTime   = getI64BE(h + 10);
     return hdr;
 }
 
@@ -133,6 +142,7 @@ inline void encodeHeader(uint8_t* h, const PacketHeader& hdr) {
     h[1] = hdr.streamId;
     putU32BE(h + 2, hdr.rowCount);
     putU32BE(h + 6, hdr.payloadLen);
+    putI64BE(h + 10, hdr.sendTime);
 }
 
 inline const char* streamName(uint8_t streamId) {

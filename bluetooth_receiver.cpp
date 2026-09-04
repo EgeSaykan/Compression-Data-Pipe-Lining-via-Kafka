@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include <fstream>
+#include <iostream>
 
 #include "bluetooth_receiver.h"
 #include "wire_protocol.h"
@@ -205,6 +207,7 @@ void BluetoothReceiver::run(const PacketHandler& handler) {
         printf("Phone connected!\n");
 
         bool connected = true;
+        int64_t lastOffsetMs = 0;
         while (connected) {
             const int64_t receivedBeginTimeMs = utcNowMs();
             uint8_t header[kHeaderSize];
@@ -215,6 +218,43 @@ void BluetoothReceiver::run(const PacketHandler& handler) {
             }
 
             const PacketHeader packetHeader = decodeHeader(header);
+
+            if (packetHeader.flag == CompressionFlag::CONTROL) {
+                std::vector<uint8_t> ctrlPayload(packetHeader.payloadLen);
+                if (!readExact(client_, ctrlPayload.data(), packetHeader.payloadLen)) {
+                    connected = false;
+                    continue;
+                }
+
+                ControlOp op = static_cast<ControlOp>(packetHeader.rowCount);
+                if (op == ControlOp::PING) {
+                    // Send PONG
+                    int64_t now = utcNowMs();
+                    uint8_t pongHeader[kHeaderSize];
+                    PacketHeader ph;
+                    ph.flag = CompressionFlag::CONTROL;
+                    ph.streamId = 0;
+                    ph.rowCount = static_cast<uint32_t>(ControlOp::PONG);
+                    ph.payloadLen = 8;
+                    encodeHeader(pongHeader, ph);
+
+                    uint8_t pongPayload[8];
+                    putI64BE(pongPayload, now);
+
+                    send(client_, reinterpret_cast<const char*>(pongHeader), kHeaderSize, 0);
+                    send(client_, reinterpret_cast<const char*>(pongPayload), 8, 0);
+                    printf("Sent PONG with PC time %lld\n", now);
+                } else if (op == ControlOp::SYNC_RESULT) {
+                    int64_t offset = getI64BE(ctrlPayload.data());
+                    printf("Received SYNC_RESULT: offset = %lld ms\n", offset);
+                    lastOffsetMs = offset;
+
+                    std::ofstream log("latency_log.json", std::ios::app);
+                    log << "{\"type\": \"sync\", \"offset_ms\": " << offset << ", \"pc_time\": " << utcNowMs() << "}\n";
+                }
+                continue;
+            }
+
             std::vector<uint8_t> packet(kHeaderSize + packetHeader.payloadLen);
             std::memcpy(packet.data(), header, kHeaderSize);
             if (!readExact(client_, packet.data() + kHeaderSize, packetHeader.payloadLen)) {
@@ -235,9 +275,24 @@ void BluetoothReceiver::run(const PacketHandler& handler) {
             normalizeToOpenZL(packet);
             const PacketHeader finalHeader = decodeHeader(packet.data());
 
+            // Extract creation timestamp of the first row if RAW
+            int64_t creationTs = 0;
+            if (packetHeader.flag == CompressionFlag::RAW && packetHeader.payloadLen >= 8) {
+                creationTs = getI64BE(packet.data() + kHeaderSize);
+            }
+
             printf("[%s] %u rows, %u bytes (%s -> %s)\n", streamName(finalHeader.streamId),
                    finalHeader.rowCount, finalHeader.payloadLen,
                    compressionName(packetHeader.flag), compressionName(finalHeader.flag));
+
+            {
+                std::ofstream log("latency_log.json", std::ios::app);
+                log << "{\"streamid\": " << (int)finalHeader.streamId
+                    << ", \"offset_ms\": " << lastOffsetMs
+                    << ", \"pc_time\": " << receivedBeginTimeMs
+                    << ", \"phonetime\": " << packetHeader.sendTime << "}\n";
+            }
+
             handler(finalHeader.streamId, std::move(packet),
                 receivedBeginTimeMs, receivedEndTimeMs);
         }
