@@ -22,6 +22,8 @@ receiver.cpp
 recieve_usa_kafka.cpp
 recieve_usa_rabbitmq.cpp
 read_sql.py
+*.json
+*.bin
 
 # conf
 docker-compose.rabbitmq.yml
